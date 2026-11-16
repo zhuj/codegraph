@@ -9,6 +9,7 @@ import {
   getCodeGraphDir,
   isInitialized,
   resolveServerRoot,
+  resolveWorkspaceRoot,
   unsafeConfiguredIndexRootReason,
 } from '../src/directory';
 import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
@@ -59,16 +60,40 @@ describe('nearest .codegraph workspace discovery', () => {
     const nearer = path.join(workspace, 'b', 'c');
     marker(nearer);
     expect(findNearestCodeGraphRoot(nested)).toBe(nearer);
+    expect(resolveWorkspaceRoot(nested)).toBe(nearer);
     expect(isInitialized(nearer)).toBe(false);
     expect(resolveServerRoot(nested).root).toBeNull();
+    expect(resolveServerRoot(nested).workspaceRoot).toBe(nearer);
   });
 
   it('includes HOME but never discovers a marker above it', () => {
     marker(temp);
     expect(findNearestCodeGraphRoot(nested)).toBeNull();
+    expect(resolveWorkspaceRoot(nested)).toBe(nested);
+    expect(resolveWorkspaceRoot(home)).toBe(home);
     marker(home);
     expect(findNearestCodeGraphRoot(nested)).toBe(home);
     expect(findNearestCodeGraphRoot(home)).toBe(home);
+    expect(resolveWorkspaceRoot(nested)).toBe(home);
+  });
+
+  it.each([1, 2])('keeps the current directory when only %i descendant workspaces are indexed', (count) => {
+    fs.writeFileSync(path.join(workspace, 'package.json'), '{"private":true}');
+    for (let i = 0; i < count; i++) {
+      const child = path.join(workspace, `service-${i}`);
+      fs.mkdirSync(child);
+      CodeGraph.initSync(child).close();
+    }
+
+    expect(findNearestCodeGraphRoot(workspace)).toBeNull();
+    expect(resolveWorkspaceRoot(workspace)).toBe(workspace);
+    expect(resolveServerRoot(workspace)).toEqual({
+      workspaceRoot: workspace,
+      root: null,
+      viaSubScan: false,
+      candidates: [],
+    });
+    expect(fs.existsSync(getCodeGraphDir(workspace))).toBe(false);
   });
 
   it('supports projects outside HOME', () => {
@@ -130,6 +155,50 @@ describe('nearest .codegraph workspace discovery', () => {
     expect(unsafeConfiguredIndexRootReason(home)).toContain('home');
     expect(unsafeConfiguredIndexRootReason(temp)).toContain('parent');
   });
+
+  it('CLI init falls back to cwd below HOME, then index and sync keep that workspace', () => {
+    // A marker above HOME and an indexed child are both outside the upward
+    // search. Neither may replace the current directory as the fallback.
+    marker(temp);
+    fs.writeFileSync(path.join(nested, 'package.json'), '{"private":true}');
+    const child = path.join(nested, 'service');
+    fs.mkdirSync(child);
+    CodeGraph.initSync(child).close();
+    const source = path.join(nested, 'sample.py');
+    fs.writeFileSync(source, 'def fallback_initial():\n    return 1\n');
+
+    const beforeInit = cli(nested, ['index', '--quiet']);
+    expect(beforeInit.error).toBeUndefined();
+    expect(beforeInit.status, beforeInit.stdout + beforeInit.stderr).toBe(1);
+    expect(beforeInit.stdout + beforeInit.stderr).toContain(`not initialized in ${nested}`);
+    expect(fs.existsSync(getCodeGraphDir(nested))).toBe(false);
+
+    const initialized = cli(nested, ['init', '--yes']);
+    expect(initialized.error).toBeUndefined();
+    expect(initialized.status, initialized.stdout + initialized.stderr).toBe(0);
+    expect(isInitialized(nested)).toBe(true);
+    expect(fs.existsSync(path.join(getCodeGraphDir(nested), 'config.yaml'))).toBe(true);
+    expect(fs.existsSync(getCodeGraphDir(home))).toBe(false);
+    expect(fs.existsSync(getCodeGraphDir(workspace))).toBe(false);
+
+    const readFunctions = (): string[] => {
+      const graph = CodeGraph.openSync(nested);
+      try { return graph.getNodesByKind('function').map((node) => node.name); }
+      finally { graph.close(); }
+    };
+    expect(readFunctions()).toEqual(['fallback_initial']);
+    fs.writeFileSync(source, 'def fallback_reindexed():\n    return 2\n');
+    const indexed = cli(nested, ['index', '--quiet']);
+    expect(indexed.error).toBeUndefined();
+    expect(indexed.status, indexed.stdout + indexed.stderr).toBe(0);
+    expect(readFunctions()).toEqual(['fallback_reindexed']);
+
+    fs.writeFileSync(source, 'def fallback_synced():\n    return 3\n');
+    const synced = cli(nested, ['sync']);
+    expect(synced.error).toBeUndefined();
+    expect(synced.status, synced.stdout + synced.stderr).toBe(0);
+    expect(readFunctions()).toEqual(['fallback_synced']);
+  }, 60_000);
 
   it('CLI init and manual sync from a deep child use the linked workspace and its scope', () => {
     const storage = path.join(temp, 'shared-index');

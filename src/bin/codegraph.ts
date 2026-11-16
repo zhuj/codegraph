@@ -53,7 +53,7 @@ try {
 import { Command, Option } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeConfiguredIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
+import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeConfiguredIndexRootReason, findNearestCodeGraphRoot, resolveWorkspaceRoot, planFrontload, isTaskNotification, isAgentMessage, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -261,11 +261,10 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
  * Resolve project path from argument or current directory
  * Walks up to the nearest .codegraph directory, stopping at HOME inclusively.
  * A config-only workspace must not be skipped in favor of an ancestor index.
+ * Without a marker, use the requested path or the current directory.
  */
 function resolveProjectPath(pathArg?: string): string {
-  const absolutePath = path.resolve(pathArg || process.cwd());
-
-  return findNearestCodeGraphRoot(absolutePath) ?? absolutePath;
+  return resolveWorkspaceRoot(pathArg || process.cwd());
 }
 
 /**
@@ -850,7 +849,7 @@ program
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
     // An EXPLICIT path names the project to rebuild — it is never a hint to go
-    // looking for one. resolveProjectPath walks up to the nearest initialized
+    // looking for one. resolveProjectPath walks up to the nearest workspace
     // ancestor, which is right for `codegraph query` run from a subdirectory,
     // but for a full re-index it silently rebuilt the parent's graph under a
     // normal "Done" when <path> had no index of its own (#1524). Only a bare
@@ -1490,13 +1489,8 @@ program
       const proseWords = keyworded ? [] : extractProseCandidates(prompt);
       if (!keyworded && codeTokens.length === 0 && proseWords.length === 0) { gate('noop-shape'); return; }
 
-      // Decide what to inject, shaped by WHERE the index(es) are: the nearest
-      // indexed ancestor of cwd, or — when cwd is an un-indexed workspace root
-      // whose indexed project(s) live in sub-dirs (the monorepo case, #964) —
-      // the sub-project the prompt points at, plus a `projectPath` nudge for any
-      // others. Without the down-scan the hook injected nothing at a monorepo
-      // root (it only walked up), so the validated adoption lever never fired
-      // exactly where the agent most needs it.
+      // Use the nearest workspace marker or cwd itself. The hook remains
+      // silent while that workspace is uninitialized, even if children have indexes.
       const plan = planFrontload(String(input.cwd || process.cwd()), prompt);
       if (!plan.exploreRoot && plan.nudgeProjects.length === 0) { gate('noop-no-index'); return; } // nothing reachable — the agent's normal tools apply
 

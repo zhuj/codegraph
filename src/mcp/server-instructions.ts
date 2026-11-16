@@ -96,8 +96,10 @@ files (30+ languages): one \`codegraph_explore\` call returns the verbatim, line
 of the relevant symbols PLUS the call paths between them and a blast-radius
 summary — replacing a grep + Read loop with one round-trip.
 
-This server started somewhere with no \`.codegraph/\` of its own, so there is no
-default project — but the tools are available and work **per project**:
+The default workspace is the nearest \`.codegraph/\` directory or directory
+symlink at or above the starting directory, up to HOME inclusively. If none is
+found, the starting directory itself is selected. That workspace has no initialized
+index, so the tools are available **per project** until it is initialized:
 
 - To query a project that HAS a \`.codegraph/\` index (e.g. a service inside a
   monorepo, or a second repo), pass its path as \`projectPath\` to

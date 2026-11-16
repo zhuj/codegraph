@@ -9,6 +9,8 @@ CodeGraph creates `.codegraph/config.yaml` when you initialize a workspace. Lang
 
 Starting at the current directory, CodeGraph searches upward for the first `.codegraph` directory or directory symlink. The search includes your home directory and stops there. Outside your home, it stops at the filesystem root. A closer config-only workspace takes precedence over a parent's index; `codegraph init` builds that workspace's first index. Explicit paths to `init` and `index` target that exact directory.
 
+If the search finds no `.codegraph`, the current directory is the workspace. Run `codegraph init` to create its `.codegraph/config.yaml` and index. CLI commands, MCP startup, and prompt hooks all use this fallback. An indexed child does not become the default automatically; query it with an explicit `projectPath`.
+
 ```yaml
 # .codegraph/config.yaml
 directories:

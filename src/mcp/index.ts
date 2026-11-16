@@ -210,15 +210,11 @@ export function watchdogProgressPaths(root: string | null): { progressPaths?: st
 
 /**
  * Resolve the project root the daemon machinery should key on. Returns
- * `null` when no `.codegraph/` is reachable from the candidate path — in
- * that case the caller must run in direct mode, since the daemon lockfile
- * and socket both live under `.codegraph/`.
+ * `null` when the selected workspace has no initialized index — in that case
+ * the caller stays in direct mode, since daemon state belongs to an index.
  *
- * Uses the same resolution as the engine (#1606): up-walk first, then the
- * bounded workspace down-scan that adopts a SINGLE indexed sub-project. A
- * workspace root above one indexed child therefore gets the shared daemon
- * (one watcher, one writer, keyed on the child) instead of a direct-mode
- * server per host.
+ * Uses the same resolution as the engine: the nearest workspace marker or
+ * the candidate directory itself. Indexed descendants are never adopted.
  *
  * The result is canonicalized with `realpathSync` so every client converges on
  * the same socket/lock path regardless of how it expressed the path: a client

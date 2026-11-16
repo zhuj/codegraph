@@ -416,30 +416,17 @@ export function findNearestCodeGraphRoot(startPath: string): string | null {
   return null;
 }
 
+/** Select the nearest workspace marker, or the starting directory when absent. */
+export function resolveWorkspaceRoot(startPath: string): string {
+  return findNearestCodeGraphRoot(startPath) ?? path.resolve(startPath);
+}
+
 /** Heavy/irrelevant directory names the sub-project scan never descends into. */
 const SUBPROJECT_SCAN_SKIP = new Set([
   'node_modules', '.git', '.svn', '.hg', 'dist', 'build', 'out', 'target',
   'vendor', 'bin', 'obj', '.next', '.nuxt', '.svelte-kit', '.cache', 'coverage',
   '.venv', 'venv', '__pycache__', '.turbo', '.idea', '.vscode', 'tmp', 'temp',
 ]);
-
-/** Manifests that mark a directory as a project/workspace root. The down-scan
- *  is gated on one of these so a non-project cwd (e.g. `$HOME`) is a cheap
- *  no-op instead of a deep filesystem crawl. */
-const WORKSPACE_ROOT_MANIFESTS = [
-  'package.json', 'pnpm-workspace.yaml', 'lerna.json', 'nx.json', 'turbo.json',
-  'go.work', 'go.mod', 'Cargo.toml', 'pom.xml', 'build.gradle', 'build.gradle.kts',
-  'settings.gradle', 'pyproject.toml', 'composer.json', 'Gemfile', 'rush.json',
-  'WORKSPACE', 'WORKSPACE.bazel',
-];
-
-function looksLikeProjectRoot(dir: string): boolean {
-  return WORKSPACE_ROOT_MANIFESTS.some((m) => fs.existsSync(path.join(dir, m)));
-}
-
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
 
 /**
  * Indexed sub-project roots beneath `root` (bounded breadth-first scan). For
@@ -477,63 +464,34 @@ export function findIndexedSubprojectRoots(
 
 /** Result of {@link resolveServerRoot}. */
 export interface ServerRootResolution {
-  /** The project root to serve as the default, or null when none resolved. */
+  /** Selected workspace, including an uninitialized current-directory fallback. */
+  workspaceRoot: string;
+  /** The selected workspace's initialized index, or null when it has none. */
   root: string | null;
-  /** True when `root` was adopted from the down-scan rather than the up-walk. */
+  /** Retained for compatibility; implicit child-project adoption is disabled. */
   viaSubScan: boolean;
-  /**
-   * Indexed sub-projects the down-scan saw when it ran but could NOT adopt
-   * (zero or several candidates). Empty when the up-walk resolved or the scan
-   * was skipped. Callers surface these so "no default project" errors can say
-   * what IS reachable (#1607).
-   */
+  /** Retained for compatibility; default resolution does not scan descendants. */
   candidates: string[];
 }
 
 /**
- * Whether `base` is a plausible workspace root for the sub-project down-scan.
- * Mirrors `planFrontload`'s manifest gate, widened to accept a bare `.git`
- * entry — the #1606 shape is a workspace container holding only agent config
- * and a `.git`, with every build manifest living in the indexed children. The
- * user's home directory and the filesystem root are never eligible: a stray
- * manifest there must not turn server startup into a scan that could adopt an
- * unrelated project (#1454 documents that failure mode for the prompt-hook).
- */
-function eligibleForSubprojectScan(base: string): boolean {
-  if (base === path.parse(base).root) return false;
-  let home: string | null = null;
-  try { home = os.homedir(); } catch { home = null; }
-  if (home && (base === home || base === path.resolve(home))) return false;
-  if (looksLikeProjectRoot(base)) return true;
-  return fs.existsSync(path.join(base, '.git'));
-}
-
-/**
- * Resolve the project root an MCP server should serve as its DEFAULT project
- * (#1606). Up-walk first (`findNearestCodeGraphRoot` — the common case, and
- * cheap). When nothing is indexed at or above `searchFrom`, run the bounded
- * sub-project down-scan `planFrontload` already uses, behind the workspace
- * gate above: EXACTLY ONE indexed sub-project is unambiguous and is adopted
- * as the root; zero or several yield no root, with the candidates carried so
- * the caller can name them instead of failing silently (#1607).
+ * Select the nearest workspace, falling back to `searchFrom` itself. A missing
+ * index leaves that workspace selected without adopting an indexed descendant.
+ * Callers use `root` to decide whether an index or daemon can actually be opened.
  *
- * `opts.subprojectScan: false` skips the down-scan entirely (the per-tool-call
- * retry path throttles it; the up-walk always runs).
+ * The former subprojectScan option is accepted for source compatibility only.
  */
 export function resolveServerRoot(
   searchFrom: string,
-  opts: { subprojectScan?: boolean } = {},
+  _opts: { subprojectScan?: boolean } = {},
 ): ServerRootResolution {
-  const up = findNearestCodeGraphRoot(searchFrom);
-  // A nearer workspace without an index is still a boundary. Do not borrow
-  // another workspace's graph, or descend to an unrelated indexed child.
-  if (up) return { root: isInitialized(up) ? up : null, viaSubScan: false, candidates: [] };
-  if (opts.subprojectScan === false) return { root: null, viaSubScan: false, candidates: [] };
-  const base = path.resolve(searchFrom);
-  if (!eligibleForSubprojectScan(base)) return { root: null, viaSubScan: false, candidates: [] };
-  const subs = findIndexedSubprojectRoots(base);
-  if (subs.length === 1) return { root: subs[0]!, viaSubScan: true, candidates: subs };
-  return { root: null, viaSubScan: false, candidates: subs };
+  const workspaceRoot = resolveWorkspaceRoot(searchFrom);
+  return {
+    workspaceRoot,
+    root: isInitialized(workspaceRoot) ? workspaceRoot : null,
+    viaSubScan: false,
+    candidates: [],
+  };
 }
 
 /**
@@ -843,71 +801,26 @@ export function capPromptHookInjection(text: string, max = PROMPT_HOOK_INJECTION
  * What the front-load hook should do for a prompt issued from a directory.
  */
 export interface FrontloadPlan {
-  /** Open + explore this project and inject its source as context. `null` when
-   *  there's no single project to front-load (none indexed, or several indexed
-   *  sub-projects with no clear match — see {@link nudgeProjects}). */
+  /** Open + explore the selected workspace, or null when it has no index. */
   exploreRoot: string | null;
-  /** Indexed sub-projects to surface in a "pass `projectPath`" nudge: the rest
-   *  of a monorepo's indexed projects alongside `exploreRoot`, or — when no one
-   *  project clearly matches — the full list (with `exploreRoot` null). */
+  /** Retained for compatibility; implicit descendant discovery is disabled. */
   nudgeProjects: string[];
-  /** True when the plan came from scanning DOWN into sub-projects (cwd itself
-   *  is not under any index) — the monorepo case, where a follow-up
-   *  `codegraph_explore` needs an explicit `projectPath`. */
+  /** Retained for compatibility; the plan always uses the selected workspace. */
   viaSubScan: boolean;
 }
 
 /**
- * Decide what the front-load hook injects for a `prompt` issued from `cwd`,
- * shaped by where the `.codegraph/` index(es) actually are:
- *   1. **cwd (or an ancestor) is indexed** → front-load that project. The
- *      normal single-project / nested-file case.
- *   2. **cwd isn't indexed but looks like a workspace root** → the indexes live
- *      in sub-projects (the monorepo case behind #964). One indexed
- *      sub-project → front-load it; several → front-load the one the prompt
- *      names (by relative path like `packages/api`, or package directory name)
- *      and nudge about the rest; several with no match → nudge the full list so
- *      the agent passes `projectPath`, rather than guessing wrong.
- *   3. **nothing indexed reachable** → do nothing (the agent's own tools apply).
+ * Inject only the selected workspace's index. When no marker exists at or
+ * above cwd, cwd remains the workspace and the hook stays silent until it is
+ * initialized. A prompt mentioning an indexed child does not change the root.
  */
-export function planFrontload(cwd: string, prompt: string): FrontloadPlan {
-  const none: FrontloadPlan = { exploreRoot: null, nudgeProjects: [], viaSubScan: false };
-
-  // Share the CLI/MCP workspace boundary, including HOME and config-only roots.
-  const nearest = findNearestCodeGraphRoot(cwd);
-  if (nearest) {
-    return isInitialized(nearest)
-      ? { exploreRoot: nearest, nudgeProjects: [], viaSubScan: false }
-      : none;
-  }
-
-  // 2. down-scan — only from something that looks like a workspace root, so a
-  //    non-project cwd (e.g. $HOME) is a cheap no-op, not a deep crawl.
-  const base = path.resolve(cwd);
-  if (!looksLikeProjectRoot(base)) return none;
-  const subs = findIndexedSubprojectRoots(base);
-  if (subs.length === 0) return none;
-  if (subs.length === 1) return { exploreRoot: subs[0]!, nudgeProjects: [], viaSubScan: true };
-
-  // Several indexed sub-projects — pick the one the prompt points at, if any.
-  const p = prompt.toLowerCase();
-  let best: { root: string; score: number; relLen: number } | null = null;
-  for (const s of subs) {
-    const rel = path.relative(base, s);
-    const relLc = rel.split(path.sep).join('/').toLowerCase();
-    const name = path.basename(s).toLowerCase();
-    let score = 0;
-    if (relLc && p.includes(relLc)) score = 10;                         // "packages/api"
-    else if (name.length >= 3 && new RegExp(`\\b${escapeRegExp(name)}\\b`).test(p)) score = 5; // "api"
-    if (score > 0 && (!best || score > best.score || (score === best.score && rel.length < best.relLen))) {
-      best = { root: s, score, relLen: rel.length };
-    }
-  }
-  if (best) {
-    return { exploreRoot: best.root, nudgeProjects: subs.filter((s) => s !== best!.root), viaSubScan: true };
-  }
-  // No clear match — nudge the full list rather than front-load a guess.
-  return { exploreRoot: null, nudgeProjects: subs, viaSubScan: true };
+export function planFrontload(cwd: string, _prompt: string): FrontloadPlan {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  return {
+    exploreRoot: isInitialized(workspaceRoot) ? workspaceRoot : null,
+    nudgeProjects: [],
+    viaSubScan: false,
+  };
 }
 
 /**

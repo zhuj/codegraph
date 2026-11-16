@@ -22,6 +22,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
 import { once } from 'events';
+import { pathToFileURL } from 'url';
 import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
@@ -130,6 +131,48 @@ describe('MCP project resolution via roots/list (issue #196)', () => {
     expect(text).toContain('CodeGraph Status');
     expect(text).not.toContain('No CodeGraph project is loaded');
   }, 20000);
+
+  it('retains an uninitialized client workspace and picks up its index on a later call', async () => {
+    child = spawnServer(cwdDir);
+    const messages = collectMessages(child);
+    send(child, {
+      jsonrpc: '2.0', id: 0, method: 'initialize',
+      params: { protocolVersion: '2025-11-25', capabilities: { roots: {} }, clientInfo: CLIENT_INFO },
+    });
+    await waitForMessage(messages, (m) => m.id === 0 && !!m.result, 5000);
+    send(child, { jsonrpc: '2.0', method: 'notifications/initialized' });
+    send(child, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
+    const rootsReq = await waitForMessage(messages, (m) => m.method === 'roots/list', 5000);
+    send(child, {
+      jsonrpc: '2.0', id: rootsReq.id,
+      result: { roots: [{ uri: pathToFileURL(projectDir).href, name: 'selected' }] },
+    });
+
+    const pending = await waitForMessage(messages, (m) => m.id === 1, 8000);
+    const guidance = pending.result.content[0].text as string;
+    expect(guidance).toContain('No CodeGraph project is loaded');
+    expect(guidance).toContain(path.basename(projectDir));
+    expect(guidance).not.toContain(path.basename(cwdDir));
+    expect(fs.existsSync(path.join(projectDir, '.codegraph'))).toBe(false);
+    expect(fs.existsSync(path.join(cwdDir, '.codegraph'))).toBe(false);
+
+    fs.writeFileSync(path.join(projectDir, 'selected.py'), 'def client_workspace_marker():\n    return 1\n');
+    const cg = await CodeGraph.init(projectDir);
+    try { await cg.indexFiles(['selected.py']); }
+    finally { cg.close(); }
+    send(child, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
+    const status = await waitForMessage(messages, (m) => m.id === 2, 8000);
+    expect(status.result.content[0].text).toContain('CodeGraph Status');
+    expect(status.result.content[0].text).toContain('**Files indexed:** 1');
+    send(child, {
+      jsonrpc: '2.0', id: 3, method: 'tools/call',
+      params: { name: 'codegraph_search', arguments: { query: 'client_workspace_marker' } },
+    });
+    const search = await waitForMessage(messages, (m) => m.id === 3, 8000);
+    expect(search.result.content[0].text).toContain('client_workspace_marker');
+    expect(messages.filter((m) => m.method === 'roots/list')).toHaveLength(1);
+    expect(fs.existsSync(path.join(cwdDir, '.codegraph'))).toBe(false);
+  }, 30000);
 
   it('returns an actionable error when there is no rootUri and no roots capability', async () => {
     child = spawnServer(cwdDir);

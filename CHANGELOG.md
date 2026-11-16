@@ -18,6 +18,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Commands discover the nearest `.codegraph` directory or symlink up to your home directory, including a workspace whose index has not been built yet.
 - Background rescans recover missed file events and reload workspace settings without restarting the server.
 
+### Fixes
+
+- When no `.codegraph` is found up to your home directory, CLI commands, MCP startup, and prompt hooks use the current directory without automatically selecting an indexed child project.
+
 ### Security
 
 - Anonymous telemetry and automatic update checks now require explicit opt-in, and the installer defaults to declining optional external interactions.

@@ -75,6 +75,7 @@ export {
   getCodeGraphDir,
   isInitialized,
   findNearestCodeGraphRoot,
+  resolveWorkspaceRoot,
   CODEGRAPH_DIR,
 } from './directory';
 export { IndexProgress, IndexResult, SyncResult } from './extraction';
