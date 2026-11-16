@@ -42,7 +42,7 @@ describe('update check (#1243)', () => {
 
   const deps = (over: Record<string, unknown> = {}) => ({
     dir,
-    env: {} as NodeJS.ProcessEnv,
+    env: { CODEGRAPH_UPDATE_CHECK: '1' } as NodeJS.ProcessEnv,
     now: () => T0,
     currentVersion: '1.4.0',
     resolveLatest: async () => 'v1.5.0',
@@ -158,7 +158,7 @@ describe('update check (#1243)', () => {
       ['DO_NOT_TRACK', 'true'],
     ])('%s=%s disables the network call AND the notice', async (key, val) => {
       let calls = 0;
-      const env = { [key]: val } as NodeJS.ProcessEnv;
+      const env = { CODEGRAPH_UPDATE_CHECK: '1', [key]: val } as NodeJS.ProcessEnv;
       expect(updateCheckDisabled(env)).toBe(true);
       const d = deps({ env, resolveLatest: async () => { calls++; return 'v1.5.0'; } });
       expect(await refreshUpdateCheck(d)).toBeNull();
@@ -167,10 +167,26 @@ describe('update check (#1243)', () => {
       expect(fs.existsSync(updateCheckCachePath(dir))).toBe(false);
     });
 
-    it('falsy values do not disable', () => {
-      expect(updateCheckDisabled({ DO_NOT_TRACK: '0' } as NodeJS.ProcessEnv)).toBe(false);
-      expect(updateCheckDisabled({ DO_NOT_TRACK: 'false' } as NodeJS.ProcessEnv)).toBe(false);
-      expect(updateCheckDisabled({} as NodeJS.ProcessEnv)).toBe(false);
+    it.each([undefined, '', '0', 'false', 'yes', 'invalid'])('does not check or create state without explicit opt-in (%s)', async value => {
+      let calls = 0;
+      const env = { CODEGRAPH_UPDATE_CHECK: value };
+      const d = deps({ env, resolveLatest: async () => { calls++; return 'v1.5.0'; } });
+      expect(updateCheckDisabled(env)).toBe(true);
+      expect(await refreshUpdateCheck(d)).toBeNull();
+      expect(getUpdateNotice(d)).toBeNull();
+      const logs: string[] = [];
+      checkForUpdateInBackground(d, line => logs.push(line));
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(calls).toBe(0);
+      expect(logs).toEqual([]);
+      expect(fs.existsSync(updateCheckCachePath(dir))).toBe(false);
+    });
+
+    it('requires an explicit opt-in even when opt-out flags are false', () => {
+      expect(updateCheckDisabled({ DO_NOT_TRACK: '0' })).toBe(true);
+      expect(updateCheckDisabled({ DO_NOT_TRACK: 'false' })).toBe(true);
+      expect(updateCheckDisabled({ CODEGRAPH_UPDATE_CHECK: '1', DO_NOT_TRACK: '0' })).toBe(false);
+      expect(updateCheckDisabled({ CODEGRAPH_UPDATE_CHECK: 'true', CODEGRAPH_NO_UPDATE_CHECK: 'false' })).toBe(false);
     });
   });
 

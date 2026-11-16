@@ -25,7 +25,7 @@ reading files (cached intelligence: thousands of parse/trace decisions you
 don't pay to re-reason each run). It indexes 30+ languages
 (TypeScript/JavaScript, Python, Go, Rust, Java, C#, C/C++, PHP, Ruby, Swift,
 Kotlin, and more) — don't assume a language here isn't covered. Reads are
-sub-millisecond; the index lags writes by ~1s through the file watcher. Reach for it BEFORE *and* while
+sub-millisecond; background freshness follows the workspace's configured sync interval. Reach for it BEFORE *and* while
 writing or editing code — not just for questions: one call returns the
 verbatim source PLUS who calls it and what it affects, so you edit with the
 blast radius in view. More accurate context, in far fewer tokens and
@@ -72,7 +72,7 @@ calls; a grep/read exploration is dozens.
 ## Limitations
 
 - If a tool reports a project isn't indexed (no \`.codegraph/\`), stop calling codegraph tools for that project for the rest of the session and use your built-in tools there instead. Indexing is the user's decision — mention they can run \`codegraph init\` if it comes up, but don't run it yourself.
-- Index lags file writes by ~1 second.
+- Index freshness follows \`.codegraph/config.yaml\` background settings; explicit sync/index commands run immediately.
 - Cross-file resolution is best-effort name matching; ambiguous calls may return multiple candidates.
 - No live correctness validation — that's still the TypeScript compiler / test suite / linter's job. Codegraph supplements those with structural context they don't have.
 `;

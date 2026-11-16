@@ -81,7 +81,7 @@ function markerBlock(): string {
     '# (e.g. WSL2 /mnt drives). Runs in the background so it never blocks git.',
     '# Managed by codegraph; remove with `codegraph uninit` or delete this block.',
     'if command -v codegraph >/dev/null 2>&1; then',
-    '  ( codegraph sync >/dev/null 2>&1 & ) >/dev/null 2>&1',
+    '  ( codegraph sync --background --quiet >/dev/null 2>&1 & ) >/dev/null 2>&1',
     'fi',
     MARKER_END,
   ].join('\n');

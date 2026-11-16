@@ -52,9 +52,9 @@ describe('Telemetry', () => {
   });
 
   describe('consent precedence', () => {
-    it('defaults to enabled when nothing decides otherwise', () => {
+    it('defaults to disabled when nothing decides otherwise', () => {
       const t = make();
-      expect(t.getStatus()).toMatchObject({ enabled: true, decidedBy: 'default', machineId: null });
+      expect(t.getStatus()).toMatchObject({ enabled: false, decidedBy: 'default', machineId: null });
     });
 
     it('DO_NOT_TRACK beats everything, including a forced-on env and config', () => {
@@ -81,9 +81,9 @@ describe('Telemetry', () => {
   });
 
   describe('off is off', () => {
-    it('disabled: records nothing, sends nothing, creates no files', async () => {
+    it.each([undefined, '0', 'false', 'yes', 'no', 'invalid'])('without explicit opt-in (%s): records nothing, sends nothing, creates no files', async value => {
       const fetchSpy = mockFetch(calls);
-      const t = make({ env: { CODEGRAPH_TELEMETRY: '0' }, fetchImpl: fetchSpy });
+      const t = make({ env: { CODEGRAPH_TELEMETRY: value }, fetchImpl: fetchSpy });
       t.recordUsage('mcp_tool', 'codegraph_explore', true);
       t.recordLifecycle('install', { scope: 'local', kind: 'fresh' });
       t.persistSync();
@@ -94,8 +94,60 @@ describe('Telemetry', () => {
       expect(stderrLines).toEqual([]);
     });
 
+    it('does not treat an older default-on notice as consent or send its buffered events', async () => {
+      const t = make();
+      fs.writeFileSync(t.configPath, JSON.stringify({
+        enabled: true, machine_id: 'old-default-identity', consent_source: 'default-notice',
+        first_run_notice_shown: true, updated_at: nowValue.toISOString(),
+      }));
+      fs.writeFileSync(t.queuePath, JSON.stringify({ v: 2, ev: 'install', ts: nowValue.toISOString(), props: {} }) + '\n');
+      const before = fs.readFileSync(t.queuePath, 'utf8');
+      t.recordLifecycle('index', {});
+      t.persistSync();
+      t.startInterval();
+      await t.flushNow();
+      t.stopInterval();
+      expect(t.getStatus()).toMatchObject({ enabled: false, machineId: null });
+      expect(t.hasStoredChoice()).toBe(false);
+      expect(fs.readFileSync(t.queuePath, 'utf8')).toBe(before);
+      expect(calls).toEqual([]);
+      expect(stderrLines).toEqual([]);
+
+      t.setEnabled(true, 'cli');
+      expect(t.getStatus().machineId).not.toBe('old-default-identity');
+      await t.flushNow();
+      expect(calls).toEqual([]); // Opting in now does not authorize the legacy queue.
+      t.recordLifecycle('index', {});
+      await t.flushNow();
+      expect(calls).toHaveLength(1);
+    });
+
+    it.each([true, false])('an environment opt-in discards unconsented queues and stale claims (legacy config=%s)', async legacyConfig => {
+      const t = make({ env: { CODEGRAPH_TELEMETRY: '1' } });
+      if (legacyConfig) fs.writeFileSync(t.configPath, JSON.stringify({
+        enabled: true, machine_id: 'old-default-identity', consent_source: 'default-notice',
+        first_run_notice_shown: true, updated_at: nowValue.toISOString(),
+      }));
+      const oldEvent = JSON.stringify({ v: 2, ev: 'install', ts: nowValue.toISOString(), props: { old: true } }) + '\n';
+      fs.writeFileSync(t.queuePath, oldEvent);
+      const claim = path.join(dir, 'telemetry-queue.sending.99999.jsonl');
+      fs.writeFileSync(claim, oldEvent);
+      const old = new Date(nowValue.getTime() - 2 * 60 * 60_000);
+      fs.utimesSync(claim, old, old);
+      await t.flushNow();
+      expect(calls).toEqual([]);
+      expect(fs.existsSync(t.queuePath)).toBe(false);
+      expect(fs.existsSync(claim)).toBe(false);
+      t.recordLifecycle('index', { current: true });
+      await t.flushNow();
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.body.events).toEqual([{ event: 'index', ts: nowValue.toISOString(), props: { current: true } }]);
+      expect(make().isEnabled()).toBe(false);
+    });
+
     it('turning telemetry off deletes buffered unsent data', () => {
       const t = make();
+      t.setEnabled(true, 'cli');
       t.recordUsage('cli_command', 'init', true);
       t.persistSync();
       expect(fs.existsSync(t.queuePath)).toBe(true);
@@ -105,12 +157,13 @@ describe('Telemetry', () => {
   });
 
   describe('first-run notice & machine id', () => {
-    it('recording only buffers — no notice, no config until something is sent', async () => {
-      const t = make();
+    it('an environment opt-in prepares identity but buffers silently until something is sent', async () => {
+      const t = make({ env: { CODEGRAPH_TELEMETRY: '1' } });
       t.recordUsage('mcp_tool', 'codegraph_explore', true);
       t.recordUsage('mcp_tool', 'codegraph_node', true);
       expect(stderrLines).toEqual([]); // local buffering is silent
-      expect(fs.existsSync(t.configPath)).toBe(false);
+      expect(fs.existsSync(t.configPath)).toBe(true);
+      expect(t.getStatus().machineId).toMatch(/^[0-9a-f-]{36}$/);
       // Same-day rollups aren't sendable yet — even a flush stays silent.
       await t.flushNow();
       expect(stderrLines).toEqual([]);
@@ -118,7 +171,7 @@ describe('Telemetry', () => {
     });
 
     it('prints the notice exactly once, before the first actual send', async () => {
-      const t = make();
+      const t = make({ env: { CODEGRAPH_TELEMETRY: '1' } });
       t.recordLifecycle('index', { languages: ['go'] });
       await t.flushNow();
       t.recordLifecycle('index', { languages: ['rust'] });
@@ -129,11 +182,14 @@ describe('Telemetry', () => {
       expect(stderrLines[0]).toContain('CODEGRAPH_TELEMETRY=0');
       const config = JSON.parse(fs.readFileSync(t.configPath, 'utf8'));
       expect(config.machine_id).toMatch(/^[0-9a-f-]{36}$/);
-      expect(config.consent_source).toBe('default-notice');
+      expect(config.consent_source).toBe('environment');
+      expect(config.enabled).toBe(false);
+      expect(make().isEnabled()).toBe(false); // Removing the env override restores the default.
     });
 
     it('keeps the machine id stable across instances and explicit toggles', async () => {
       const t = make();
+      t.setEnabled(true, 'cli');
       t.recordLifecycle('install', { scope: 'local', kind: 'fresh' });
       await t.flushNow();
       const id1 = t.getStatus().machineId;
@@ -154,6 +210,8 @@ describe('Telemetry', () => {
   });
 
   describe('rollups & sending', () => {
+    beforeEach(() => { make().setEnabled(true, 'cli'); });
+
     it('aggregates per (day, kind, name, client) and sends only completed days', async () => {
       const t = make();
       const client = { name: 'Claude Code', version: '2.1' };
@@ -271,6 +329,8 @@ describe('Telemetry', () => {
   });
 
   describe('buffer robustness', () => {
+    beforeEach(() => { make().setEnabled(true, 'cli'); });
+
     it('caps the queue and drops oldest lines without leaving partial JSON', () => {
       const t = make();
       const bigProps = { targets: Array.from({ length: 50 }, (_, i) => `agent-${i}`) };
@@ -329,6 +389,7 @@ describe('Telemetry', () => {
     it('never writes to stdout', async () => {
       const stdoutSpy = vi.spyOn(process.stdout, 'write');
       const t = make({ env: { CODEGRAPH_TELEMETRY_DEBUG: '1' } });
+      t.setEnabled(true, 'cli');
       t.recordUsage('mcp_tool', 'codegraph_explore', true);
       t.recordLifecycle('install', { scope: 'local', kind: 'fresh' });
       await t.flushNow();

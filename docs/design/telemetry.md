@@ -12,6 +12,9 @@ of anonymous counters, documented field-by-field, easy to turn off, and impossib
 quietly. This doc is the contract; `TELEMETRY.md` (repo root, user-facing) restates it and the
 implementation must never collect anything not listed there.
 
+Telemetry is off by default. These counters are collected only after explicit consent;
+normal CLI and MCP use creates no telemetry identity or queue and makes no telemetry request.
+
 ## Goals
 
 Answer, in aggregate and anonymously:
@@ -45,7 +48,8 @@ Answer, in aggregate and anonymously:
    hot path (only a small local consent-file read), zero new npm dependencies (global `fetch`, Node ≥18),
    zero bytes on stdout (stdio is the MCP protocol channel), zero retries, zero error noise.
    Every failure mode is silence.
-3. **Off is off.** When disabled, no process opens a socket to the telemetry endpoint — not
+3. **Off by default.** Only an explicit stored choice or environment opt-in enables
+   collection. When disabled, no process opens a socket to the telemetry endpoint — not
    even an "opted out" ping.
 4. **First-party endpoint.** Clients only ever talk to `telemetry.getcodegraph.com`. The URL
    baked into a published npm version POSTs there forever, so the domain must be ours; the
@@ -57,7 +61,7 @@ Common envelope on every batch (identity revalidated before each request):
 
 | field | example | notes |
 |---|---|---|
-| `machine_id` | `b3a8…` (UUIDv4) | random, minted at first run, stored in global config |
+| `machine_id` | `b3a8…` (UUIDv4) | random, minted only after explicit opt-in, stored in global config |
 | `codegraph_version` | `0.9.12` | from package.json |
 | `os` / `arch` | `darwin` / `arm64` | `process.platform` / `process.arch` |
 | `node_major` | `22` | major only |
@@ -114,20 +118,25 @@ computed from it directly in SQL.
 Resolution order (first match wins):
 
 1. `DO_NOT_TRACK=1` (community standard — always honored) → off
-2. `CODEGRAPH_TELEMETRY=0|1` → forced off/on for that process
-3. Global config `~/.codegraph/telemetry.json` → stored user choice
-4. Default: **on**, gated by the first-run notice below
+2. `CODEGRAPH_TELEMETRY=1` or `true` → forced on for that process; other non-empty values → off
+3. Global config `~/.codegraph/telemetry.json` → explicit stored installer or CLI choice
+4. Default: **off**, without a notice, identity, queue, or request
+
+A legacy `consent_source: "default-notice"` record is not consent. An environment-only
+opt-in does not enable future processes after the variable is removed. A new explicit
+opt-in discards historical unconsented queues and crash claims before collecting new events.
 
 Surfaces:
 
 - **Installer (interactive):** a visible clack toggle in the existing prompt flow —
   "Share anonymous usage data? (no code, paths, or names — see TELEMETRY.md)" — default
-  yes. Choice persisted with `consent_source: "installer"`. Re-runs/upgrades respect the
-  stored choice and don't re-ask.
+  no. Choice persisted with `consent_source: "installer"`. Re-runs/upgrades respect an
+  explicit stored choice and don't re-ask. Skipping or cancelling this prompt, or using
+  `--yes`, leaves telemetry off unless the user previously opted in.
 - **Headless paths** (`npx codegraph init`, MCP server — no TTY, never prompt): right
-  before the **first actual send** (recording only buffers locally and stays silent — so
-  the installer's explicit toggle always precedes any notice), print one line to
-  **stderr** and record `first_run_notice_shown`:
+  before the **first actual send after an explicit environment opt-in**, print one line
+  to **stderr** and record `first_run_notice_shown`. Normal default invocations stay silent;
+  an explicit installer or CLI choice already acknowledges collection:
   `codegraph collects anonymous usage stats (no code or paths) — "codegraph telemetry off" or CODEGRAPH_TELEMETRY=0 disables. Details: TELEMETRY.md`
 - **CLI:** `codegraph telemetry status|on|off` (status prints the machine ID, current
   state, and what decided it). Deleting `~/.codegraph/telemetry.json` resets everything,
@@ -144,15 +153,22 @@ Surfaces:
 {
   "enabled": true,
   "machine_id": "uuid-v4",
-  "consent_source": "installer | default-notice | cli",
+  "consent_source": "installer | cli | environment",
   "first_run_notice_shown": true,
   "updated_at": "2026-06-12T00:00:00Z"
 }
 ```
 
-(`~/.codegraph/` is new — today nothing global exists. Coexists by filename if a user ever
-indexes `$HOME` itself, since per-project data lives in `<project>/.codegraph/` with fixed
-other filenames.)
+Environment-only state stores its identity without changing the persistent enabled
+choice. The legacy `default-notice` source remains readable solely for migration.
+Global telemetry files coexist by filename with a home-level workspace's config and index.
+
+Automatic release checks are separately off by default and require
+`CODEGRAPH_UPDATE_CHECK=1` or `true`; `DO_NOT_TRACK` and `CODEGRAPH_NO_UPDATE_CHECK` override
+that opt-in. The npm launcher's fallback download requires `CODEGRAPH_ALLOW_DOWNLOAD=1`
+or `true`, with `CODEGRAPH_NO_DOWNLOAD` taking precedence. Explicit `codegraph upgrade`
+remains a user-requested network operation. The stdio MCP server opens no auxiliary TCP
+or HTTP listener; shared-daemon communication uses local Unix sockets or named pipes.
 
 ## Client architecture
 
@@ -160,7 +176,8 @@ New module `src/telemetry/` (single small module, no deps):
 
 - **Counters in memory** — recording a tool call/CLI command is an in-memory increment.
   The small consent file is refreshed before recording so another process's opt-out is
-  observed. No queue writes or network requests run on this path. MCP tool handlers call
+  observed. An environment opt-in prepares its identity once before collection. No queue
+  writes or network requests run on this path. MCP tool handlers call
   `telemetry.count('mcp_tool', name, ok)` and move on.
 - **Buffer** — counters persist (debounced, async) to `~/.codegraph/telemetry-queue.jsonl`.
   Hard cap ~256 KB; on overflow drop oldest lines. Corrupt buffer → truncate, never throw.

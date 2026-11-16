@@ -68,9 +68,9 @@ function writeHostPpidLauncher(binDir: string): void {
 
 // Launch the shim with async spawn so the in-process HTTPS server can respond
 // while it runs (spawnSync would block this event loop and deadlock).
-function runShim(pkgDir: string, args: string[], env: Record<string, string>) {
+function runShim(pkgDir: string, args: string[], env: Record<string, string>, preload?: string) {
   return new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
-    const child = spawn(process.execPath, [path.join(pkgDir, 'npm-shim.js'), ...args], {
+    const child = spawn(process.execPath, [...(preload ? ['--require', preload] : []), path.join(pkgDir, 'npm-shim.js'), ...args], {
       env: { ...process.env, ...env },
     });
     let stdout = '', stderr = '';
@@ -98,6 +98,50 @@ describe('npm-shim windowsHide (#1092)', () => {
 });
 
 describe.skipIf(isWindows)('npm-shim launcher', () => {
+  it.each(['', '0', 'false', 'invalid'])('never downloads a missing bundle without explicit opt-in (%s)', async optIn => {
+    const pkg = makePkg();
+    const cache = mkTmp('offline');
+    const log = path.join(cache, 'network.jsonl');
+    fs.writeFileSync(log, '');
+    try {
+      const r = await runShim(pkg, ['status'], {
+        CODEGRAPH_INSTALL_DIR: cache,
+        CODEGRAPH_NO_DOWNLOAD: '',
+        CODEGRAPH_ALLOW_DOWNLOAD: optIn,
+        CG_TEST_NETWORK_LOG: log,
+      }, path.join(__dirname, 'fixtures/deny-network.cjs'));
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('disabled by default');
+      expect(r.stderr).toContain('CODEGRAPH_ALLOW_DOWNLOAD=1');
+      expect(fs.readFileSync(log, 'utf8')).toBe('');
+      expect(fs.existsSync(path.join(cache, 'bundles'))).toBe(false);
+    } finally {
+      fs.rmSync(pkg, { recursive: true, force: true });
+      fs.rmSync(cache, { recursive: true, force: true });
+    }
+  });
+
+  it('only attempts the network fallback after opting in, and honors the explicit download veto', async () => {
+    const pkg = makePkg();
+    const cache = mkTmp('opt-in');
+    const log = path.join(cache, 'network.jsonl');
+    fs.writeFileSync(log, '');
+    try {
+      const env = { CODEGRAPH_INSTALL_DIR: cache, CODEGRAPH_ALLOW_DOWNLOAD: '1', CG_TEST_NETWORK_LOG: log };
+      const guard = path.join(__dirname, 'fixtures/deny-network.cjs');
+      const blocked = await runShim(pkg, ['status'], { ...env, CODEGRAPH_NO_DOWNLOAD: '1' }, guard);
+      expect(blocked.status).toBe(1);
+      expect(fs.readFileSync(log, 'utf8')).toBe('');
+      const optedIn = await runShim(pkg, ['status'], { ...env, CODEGRAPH_NO_DOWNLOAD: '' }, guard);
+      expect(optedIn.status).toBe(1); // The test guard rejects the deliberate HTTP request.
+      expect(optedIn.stderr).toContain('downloading');
+      expect(fs.readFileSync(log, 'utf8')).toContain('node:https:get');
+    } finally {
+      fs.rmSync(pkg, { recursive: true, force: true });
+      fs.rmSync(cache, { recursive: true, force: true });
+    }
+  });
+
   it('runs the installed optional-dependency bundle without any download', async () => {
     const pkg = makePkg();
     const platformPkg = path.join(pkg, 'node_modules', '@colbymchenry', `codegraph-${target}`);
@@ -250,6 +294,7 @@ describe.skipIf(!CAN_NET)('npm-shim download fallback (local HTTPS)', () => {
     return {
       CODEGRAPH_INSTALL_DIR: cache,
       CODEGRAPH_DOWNLOAD_BASE: `https://127.0.0.1:${port}`,
+      CODEGRAPH_ALLOW_DOWNLOAD: '1',
       NODE_TLS_REJECT_UNAUTHORIZED: '0',
     };
   }

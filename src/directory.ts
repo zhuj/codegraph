@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { isWslWindowsDrive } from './sync/watch-policy';
+import { ensureWorkspaceConfig, hasExplicitScanDirectories, loadScanDirectories } from './workspace-config';
 
 /** The default per-project data directory name. */
 export const DEFAULT_CODEGRAPH_DIR = '.codegraph';
@@ -96,8 +97,8 @@ export function isCodeGraphDataDir(name: string): boolean {
  *
  *   1. `.codegraph-wsl/` exists → it. Once WSL has its own index it keeps it,
  *      even after Windows builds a `.codegraph` beside it.
- *   2. `.codegraph/codegraph.db` exists → `.codegraph`. An index built before
- *      this default is kept rather than silently rebuilt somewhere else.
+ *   2. `.codegraph/` exists → `.codegraph`. An existing index or config-only
+ *      workspace (including a directory symlink) keeps its chosen storage.
  *   3. neither → `.codegraph-wsl`, so a fresh WSL index never shares.
  *
  * Every other host keeps the plain name without a stat: the WSL check is
@@ -110,7 +111,11 @@ export function codeGraphDirNameFor(projectRoot: string): string {
   } catch {
     // absent — fall through
   }
-  if (fs.existsSync(path.join(projectRoot, DEFAULT_CODEGRAPH_DIR, 'codegraph.db'))) return DEFAULT_CODEGRAPH_DIR;
+  try {
+    if (fs.statSync(path.join(projectRoot, DEFAULT_CODEGRAPH_DIR)).isDirectory()) return DEFAULT_CODEGRAPH_DIR;
+  } catch {
+    // absent or unusable — give a fresh WSL workspace separate storage
+  }
   return WSL_CODEGRAPH_DIR;
 }
 
@@ -284,6 +289,20 @@ export function unsafeIndexRootReason(projectRoot: string): string | null {
   return null;
 }
 
+/** A home-level workspace is safe to scan only when YAML narrows its scope. */
+export function unsafeConfiguredIndexRootReason(projectRoot: string): string | null {
+  const reason = unsafeIndexRootReason(projectRoot);
+  if (reason !== 'your home directory') return reason;
+  if (hasExplicitScanDirectories(projectRoot)) {
+    const directories = loadScanDirectories(projectRoot);
+    // A relative name may point through a symlink to / or HOME. It must not
+    // accidentally turn a narrow home-level workspace into a whole-tree scan.
+    if (!directories.includes('.') && directories.every((dir) =>
+      unsafeIndexRootReason(path.resolve(projectRoot, dir)) === null)) return null;
+  }
+  return reason;
+}
+
 /**
  * `dev:ino` for a path, or null if it can't be stat'd or the platform doesn't
  * report a usable inode. Read as bigints: WSL DrvFs (`/mnt/c`) reports inodes
@@ -358,24 +377,42 @@ export function isSameIndexRoot(a: string, b: string): boolean {
   return id !== null && id === statInode(getCodeGraphDir(b));
 }
 
+/**
+ * Find the nearest workspace marker, including one that is not indexed yet.
+ * stat follows a .codegraph symlink, while the workspace remains its parent.
+ * A home-contained search includes HOME and never examines its ancestors.
+ * Projects outside HOME (for example /work or /tmp) stop at the filesystem root.
+ */
 export function findNearestCodeGraphRoot(startPath: string): string | null {
   let current = path.resolve(startPath);
-  const root = path.parse(current).root;
-
-  while (current !== root) {
-    if (isInitialized(current)) {
-      return current;
+  const home = path.resolve(os.homedir());
+  const inside = (child: string, parent: string): boolean => {
+    const relative = path.relative(parent, child);
+    return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+  };
+  let boundary = inside(current, home) ? home : path.parse(current).root;
+  // HOME or the starting path may itself be an alias. Preserve lexical paths
+  // when possible, but do not walk outside the real home through an alias.
+  if (boundary !== home) {
+    const realHome = canonicalProjectRoot(home);
+    const realCurrent = canonicalProjectRoot(current);
+    if (inside(realCurrent, realHome)) {
+      current = realCurrent;
+      boundary = realHome;
     }
+  }
+
+  while (true) {
+    try {
+      if (fs.statSync(getCodeGraphDir(current)).isDirectory()) return current;
+    } catch {
+      // Missing, broken or inaccessible markers are not usable directories.
+    }
+    if (path.relative(boundary, current) === '') break;
     const parent = path.dirname(current);
-    if (parent === current) break; // Reached filesystem root
+    if (parent === current) break;
     current = parent;
   }
-
-  // Check root as well
-  if (isInitialized(current)) {
-    return current;
-  }
-
   return null;
 }
 
@@ -488,7 +525,9 @@ export function resolveServerRoot(
   opts: { subprojectScan?: boolean } = {},
 ): ServerRootResolution {
   const up = findNearestCodeGraphRoot(searchFrom);
-  if (up) return { root: up, viaSubScan: false, candidates: [] };
+  // A nearer workspace without an index is still a boundary. Do not borrow
+  // another workspace's graph, or descend to an unrelated indexed child.
+  if (up) return { root: isInitialized(up) ? up : null, viaSubScan: false, candidates: [] };
   if (opts.subprojectScan === false) return { root: null, viaSubScan: false, candidates: [] };
   const base = path.resolve(searchFrom);
   if (!eligibleForSubprojectScan(base)) return { root: null, viaSubScan: false, candidates: [] };
@@ -834,14 +873,12 @@ export interface FrontloadPlan {
 export function planFrontload(cwd: string, prompt: string): FrontloadPlan {
   const none: FrontloadPlan = { exploreRoot: null, nudgeProjects: [], viaSubScan: false };
 
-  // 1. up-walk — nearest indexed ancestor (incl. cwd). Cheap; covers the common
-  //    single-project case without a down-scan.
-  let dir = path.resolve(cwd);
-  for (let i = 0; i < 6; i++) {
-    if (isInitialized(dir)) return { exploreRoot: dir, nudgeProjects: [], viaSubScan: false };
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
+  // Share the CLI/MCP workspace boundary, including HOME and config-only roots.
+  const nearest = findNearestCodeGraphRoot(cwd);
+  if (nearest) {
+    return isInitialized(nearest)
+      ? { exploreRoot: nearest, nudgeProjects: [], viaSubScan: false }
+      : none;
   }
 
   // 2. down-scan — only from something that looks like a workspace root, so a
@@ -948,6 +985,7 @@ export function createDirectory(projectRoot: string): void {
   // Write .gitignore inside .codegraph (create if absent, upgrade a stale
   // pre-wildcard default left by an older version — issue #788).
   ensureGitignore(path.join(codegraphDir, '.gitignore'));
+  ensureWorkspaceConfig(projectRoot);
 }
 
 /**
@@ -1096,6 +1134,10 @@ export function validateDirectory(projectRoot: string): {
     // upgrade of an existing file is non-fatal — the index still works.
     errors.push('.gitignore missing in .codegraph directory and could not be created');
   }
+
+  // Existing indexes gain the editable config without replacing user files.
+  // A read-only checkout can still use the in-memory defaults.
+  try { ensureWorkspaceConfig(projectRoot); } catch { /* non-critical */ }
 
   return {
     valid: errors.length === 0,

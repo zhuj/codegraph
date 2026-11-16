@@ -130,7 +130,7 @@ export async function maybeOfferBetaSignup(deps: BetaSignupDeps = {}): Promise<v
     const wantsBeta = await clack.confirm({
       message:
         'Want early access to CodeGraph Pro? Join the beta waitlist — we’ll only email you about CodeGraph, never share your address.',
-      initialValue: true,
+      initialValue: false,
     });
     if (clack.isCancel(wantsBeta)) {
       clack.log.info(`Skipped — you can join anytime at ${BETA_SIGNUP_URL}.`);

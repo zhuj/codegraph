@@ -20,6 +20,7 @@ import { assertNoRebuild, releaseWriterLock, tryAcquireWriterLock, writerLockHel
 import { QueryPool, resolvePoolSize } from './query-pool';
 import { endFreshnessMeasurements } from './index-freshness';
 import { acquireProject, ProjectLease } from './project-lifecycle';
+import { loadBackgroundConfig } from '../project-config';
 
 // Lazy-load the heavy CodeGraph chain (sqlite + query/graph/context layers) OFF
 // the MCP startup path. It's only needed once a tool actually opens a project —
@@ -428,6 +429,8 @@ export class MCPEngine {
   private catchUpSync(afterReopen = false): void {
     const cg = this.cg;
     if (!cg || this.opts.readOnly) return;
+    const background = loadBackgroundConfig(cg.getProjectRoot());
+    if (!background.enabled || background.intervalSeconds === 0) return;
     // The lease's gate is the startup reconcile and stays settled once caught
     // up; a database reopened after a rebuild (#1902) needs a sync of its own.
     if (this.defaultLease && !afterReopen) {

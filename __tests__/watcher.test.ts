@@ -31,6 +31,7 @@ import {
   type WatchOptions,
 } from '../src/sync/watcher';
 import CodeGraph from '../src/index';
+import { clearProjectConfigCache, getWorkspaceConfigPath } from '../src/project-config';
 
 // Keep real filesystem operations, with writable exports for failure injection.
 vi.mock('fs', async (importOriginal) => ({ ...await importOriginal<typeof import('fs')>() }));
@@ -65,6 +66,10 @@ describe('FileWatcher', () => {
 
   const initGraph = (...args: Parameters<typeof CodeGraph.initSync>) => {
     const cg = CodeGraph.initSync(...args);
+    // These contracts exercise the legacy native-event debounce. Background
+    // cadence and its generated defaults have dedicated background-sync tests.
+    fs.writeFileSync(getWorkspaceConfigPath(args[0]), 'directories: ["."]\n');
+    clearProjectConfigCache();
     graphs.add(cg);
     return cg;
   };

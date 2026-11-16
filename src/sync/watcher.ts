@@ -36,10 +36,16 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { isSourceFile, buildScopeIgnore, type ScopeIgnore } from '../extraction';
-import { loadExtensionOverrides, PROJECT_CONFIG_FILENAME } from '../project-config';
+import {
+  getWorkspaceConfigPath,
+  hasBackgroundConfig,
+  loadBackgroundConfig,
+  loadExtensionOverrides,
+  PROJECT_CONFIG_FILENAME,
+} from '../project-config';
 import { logDebug, logWarn } from '../errors';
 import { normalizePath } from '../utils';
-import { isCodeGraphDataDir } from '../directory';
+import { isCodeGraphDataDir, unsafeConfiguredIndexRootReason } from '../directory';
 import { watchDisabledReason } from './watch-policy';
 
 /**
@@ -179,6 +185,12 @@ const IS_TEST_RUNTIME = !!(process.env.VITEST || process.env.NODE_ENV === 'test'
  */
 export interface WatchOptions {
   /**
+   * Apply the workspace's automatic indexing policy and periodic rescan.
+   * Notification-only consumers (the viewer) set false: their events never
+   * index anything and should remain immediate even when indexing is off.
+   */
+  backgroundSync?: boolean;
+  /**
    * Debounce delay in milliseconds.
    * After the last file change, wait this long before triggering sync.
    * Default: 2000ms
@@ -306,6 +318,17 @@ export class FileWatcher {
   private watchedRealDirs = new Map<string, string>();
   private treeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private periodicTimer: ReturnType<typeof setTimeout> | null = null;
+  private configWatcher: fs.FSWatcher | null = null;
+  /** Full rescans recover edits omitted/coalesced by the native watcher. */
+  private backgroundIntervalMs = 30_000;
+  /** Legacy projects keep their save debounce until they configure a rate. */
+  private backgroundRateLimitMs = 0;
+  private lastBackgroundSyncMs = 0;
+  private workspaceConfigStamp = '';
+  /** Distinguish a user/config pause from terminal resource or sync failures. */
+  private pausedByConfig = false;
+  private lastTreeRefreshMs = 0;
   /**
    * True when the pending set does NOT exactly describe the change (a
    * directory removal's children are unknown from the event, #1285) — the
@@ -363,6 +386,7 @@ export class FileWatcher {
   private readonly onSyncError?: WatchOptions['onSyncError'];
   private readonly onDegraded?: WatchOptions['onDegraded'];
   private readonly inertForTests: boolean;
+  private readonly backgroundSync: boolean;
   /**
    * Optional metadata guard supplied by the CodeGraph facade. Windows'
    * ReadDirectoryChangesW stream includes last-access updates, so a read can
@@ -384,6 +408,7 @@ export class FileWatcher {
     this.onSyncError = options.onSyncError;
     this.onDegraded = options.onDegraded;
     this.inertForTests = options.inertForTests ?? false;
+    this.backgroundSync = options.backgroundSync ?? true;
     this.isFileStateCurrent = isFileStateCurrent;
   }
 
@@ -400,6 +425,16 @@ export class FileWatcher {
     this.lockRetryCount = 0;
     this.syncFailureRetryCount = 0;
     this.needsFullScan = false;
+    this.pausedByConfig = false;
+
+    if (!this.refreshBackgroundSettings()) {
+      this.pausedByConfig = true;
+      this.stopped = true;
+      return false;
+    }
+    this.validateWorkspaceRoot();
+    this.lastBackgroundSyncMs = Date.now();
+    this.workspaceConfigStamp = this.readWorkspaceConfigStamp();
 
     // Some environments make filesystem watching unusable — most notably
     // WSL2 /mnt/ drives, where the underlying fs.watch calls block long
@@ -430,6 +465,9 @@ export class FileWatcher {
       // strategies report exhaustion identically (start() === false).
       if (this.degradedReason) return false;
 
+      this.watchWorkspaceConfig();
+      this.schedulePeriodicSync();
+
       // No async crawl to wait on: as soon as the watch set is installed we
       // have a clean baseline (pendingFiles is only populated by post-start
       // events). Clear defensively and flip ready.
@@ -442,6 +480,7 @@ export class FileWatcher {
       logDebug('File watcher started', {
         projectRoot: this.projectRoot,
         debounceMs: this.debounceMs,
+        backgroundIntervalMs: this.backgroundIntervalMs,
         mode: this.inertForTests ? 'inert' : supportsRecursiveWatch() ? 'recursive' : 'per-directory',
         watchedDirs: this.dirWatchers.size || undefined,
       });
@@ -459,6 +498,103 @@ export class FileWatcher {
       }
       return false;
     }
+  }
+
+  /** Re-read the cached YAML policy, including changes made while running. */
+  private refreshBackgroundSettings(): boolean {
+    if (!this.backgroundSync) return true;
+    const config = loadBackgroundConfig(this.projectRoot);
+    if (!config.enabled || config.intervalSeconds === 0) return false;
+    this.backgroundIntervalMs = config.intervalSeconds * 1000;
+    this.backgroundRateLimitMs = hasBackgroundConfig(this.projectRoot) ? this.backgroundIntervalMs : 0;
+    return true;
+  }
+
+  private validateWorkspaceRoot(): void {
+    const reason = unsafeConfiguredIndexRootReason(this.projectRoot);
+    if (reason) throw new Error(`Refusing background scanning of ${reason}; configure specific workspace directories first.`);
+  }
+
+  private readWorkspaceConfigStamp(): string {
+    try {
+      const stat = fs.statSync(getWorkspaceConfigPath(this.projectRoot));
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+      throw error;
+    }
+  }
+
+  /**
+   * Data directories are excluded from source watching. Watch their parent
+   * separately so YAML edits (including atomic file replacement) take effect;
+   * a .codegraph symlink is followed without scanning its storage directory.
+   */
+  private watchWorkspaceConfig(): void {
+    if (this.inertForTests || this.configWatcher || this.stopped) return;
+    const configPath = getWorkspaceConfigPath(this.projectRoot);
+    const configDir = path.dirname(configPath);
+    if (!fs.existsSync(configDir)) return;
+    try {
+      this.configWatcher = watchImpl(configDir, { persistent: false }, (_event, filename) => {
+        if (filename !== null && String(filename) !== path.basename(configPath)) return;
+        this.refreshWorkspaceConfig();
+      });
+      this.configWatcher.on('error', (error: unknown) => {
+        logDebug('Workspace config watcher unavailable; periodic sync will reload config', { error: String(error) });
+        this.configWatcher?.close();
+        this.configWatcher = null;
+      });
+    } catch (error) {
+      // The periodic stamp check is also a fallback for atomic directory or
+      // symlink replacement, for which a native watch can lose its target.
+      logDebug('Could not watch workspace config; periodic sync will reload config', { error: String(error) });
+    }
+  }
+
+  private refreshWorkspaceConfig(): void {
+    if (this.stopped) return;
+    try {
+      const stamp = this.readWorkspaceConfigStamp();
+      if (stamp === this.workspaceConfigStamp) return;
+      this.workspaceConfigStamp = stamp;
+      if (!this.refreshBackgroundSettings()) {
+        this.pausedByConfig = true;
+        this.stop();
+        return;
+      }
+      this.validateWorkspaceRoot();
+      this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
+      // A timer scheduled under the old rate must not bypass a newly longer
+      // interval (or postpone a shorter one) after this config edit.
+      if (this.treeRefreshTimer) clearTimeout(this.treeRefreshTimer);
+      this.treeRefreshTimer = null;
+      this.scheduleTreeRefresh();
+      this.needsFullScan = true;
+      this.schedulePeriodicSync();
+      this.scheduleSync();
+    } catch (error) {
+      // A malformed scope must not silently broaden what gets indexed.
+      this.pausedByConfig = true;
+      this.degrade(`Invalid workspace configuration; auto-sync disabled. ${String(error)}`);
+    }
+  }
+
+  /** One unref'ed safety scan per configured interval; flush serializes it with events. */
+  private schedulePeriodicSync(): void {
+    if (this.periodicTimer) clearTimeout(this.periodicTimer);
+    this.periodicTimer = null;
+    if (this.stopped || !this.backgroundSync) return;
+    this.periodicTimer = setTimeout(() => {
+      this.periodicTimer = null;
+      this.refreshWorkspaceConfig();
+      if (this.stopped) return;
+      this.watchWorkspaceConfig();
+      this.needsFullScan = true;
+      void this.flush();
+      this.schedulePeriodicSync();
+    }, this.backgroundIntervalMs);
+    this.periodicTimer.unref?.();
   }
 
   /**
@@ -484,6 +620,7 @@ export class FileWatcher {
 
   /** Reconcile logical directory paths with real targets, including retargeted links. */
   private refreshWatchTree(): void {
+    this.lastTreeRefreshMs = Date.now();
     if (this.stopped || this.inert) return;
     this.visitedRealDirs.clear();
     const directories = new Map<string, string>();
@@ -531,7 +668,7 @@ export class FileWatcher {
       // is installed; a full reconcile closes that race and removes old paths.
       this.needsFullScan = true;
       this.scheduleSync();
-    }, 50);
+    }, Math.max(50, this.lastTreeRefreshMs + this.backgroundRateLimitMs - Date.now()));
   }
 
   private watchDirectory(dir: string, real: string, recursive: boolean): void {
@@ -622,7 +759,12 @@ export class FileWatcher {
    * — it drops node_modules/dist/.git churn before any sync is scheduled.
    */
   private handleChange(rel: string): void {
+    if (this.stopped) return;
     if (!rel || rel === '.' || rel.startsWith('..')) return;
+    if (rel === normalizePath(path.relative(this.projectRoot, getWorkspaceConfigPath(this.projectRoot)))) {
+      this.refreshWorkspaceConfig();
+      return;
+    }
     // `.git/info/exclude` is otherwise always-ignored with the rest of `.git/`,
     // but it feeds `buildScopeIgnore` — allow it through as a scope refresh
     // when the platform delivers the event (recursive watchers may; Linux
@@ -821,6 +963,11 @@ export class FileWatcher {
     return this.degradedReason;
   }
 
+  /** A valid config edit can resume this pause without reviving terminal failures. */
+  isPausedByConfig(): boolean {
+    return this.pausedByConfig;
+  }
+
   /** Watches are live again, but the full catch-up has not committed yet. */
   isRecoveringFromLock(): boolean {
     return this.recoveringFromLock;
@@ -861,6 +1008,10 @@ export class FileWatcher {
    */
   stop(): void {
     this.stopped = true;
+    if (this.periodicTimer) clearTimeout(this.periodicTimer);
+    this.periodicTimer = null;
+    try { this.configWatcher?.close(); } catch { /* already closed */ }
+    this.configWatcher = null;
     if (this.treeRefreshTimer) clearTimeout(this.treeRefreshTimer);
     this.treeRefreshTimer = null;
     this.knownDirs.clear();
@@ -948,6 +1099,7 @@ export class FileWatcher {
    * Schedule a normal debounced sync after a source edit.
    */
   private scheduleSync(): void {
+    if (this.stopped) return;
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
     }
@@ -960,7 +1112,9 @@ export class FileWatcher {
     // the full window. Never exceeds the configured debounce (a user-lowered
     // CODEGRAPH_WATCH_DEBOUNCE_MS stays authoritative), floor 100ms.
     const quickMs = Math.max(100, Math.min(QUICK_SYNC_QUIET_MS, this.debounceMs));
-    const delay = this.pendingFiles.size <= QUICK_SYNC_MAX_PENDING ? quickMs : this.debounceMs;
+    const quietDelay = this.pendingFiles.size <= QUICK_SYNC_MAX_PENDING ? quickMs : this.debounceMs;
+    const remaining = this.lastBackgroundSyncMs + this.backgroundRateLimitMs - Date.now();
+    const delay = Math.max(quietDelay, remaining);
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
       this.flush();
@@ -973,13 +1127,14 @@ export class FileWatcher {
    * exponentially instead of hammering the lock every debounce cycle.
    */
   private scheduleRetrySync(delayMs: number): void {
+    if (this.stopped) return;
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
     }
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
       this.flush();
-    }, delayMs);
+    }, Math.max(delayMs, this.lastBackgroundSyncMs + this.backgroundRateLimitMs - Date.now()));
   }
 
   /**
@@ -998,7 +1153,20 @@ export class FileWatcher {
     // If already syncing, the post-sync check will re-trigger
     if (this.syncing || this.stopped) return;
 
+    // Catch config edits even if fs.watch dropped them. In particular, never
+    // write one last batch after the user disabled background work.
+    this.refreshWorkspaceConfig();
+    if (this.stopped) return;
+    const remaining = this.lastBackgroundSyncMs + this.backgroundRateLimitMs - Date.now();
+    if (remaining > 0) {
+      this.scheduleRetrySync(remaining);
+      return;
+    }
+    if (this.debounceTimer) clearTimeout(this.debounceTimer);
+    this.debounceTimer = null;
+
     this.syncStartedMs = Date.now();
+    this.lastBackgroundSyncMs = this.syncStartedMs;
     this.syncing = true;
 
     // Scoped fast path: when every pending change is a known file event, hand

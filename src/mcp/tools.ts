@@ -6,7 +6,7 @@
 
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
-import { findNearestCodeGraphRoot, isSameIndexRoot } from '../directory';
+import { findNearestCodeGraphRoot, isInitialized, isSameIndexRoot } from '../directory';
 import { WslSharedIndexError } from '../db/wsl-shared-index';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
@@ -2257,10 +2257,11 @@ export class ToolHandler {
     // `/private/tmp`) must share one connection and one watcher (#1835).
     const canonicalRoot = resolvedRoot ? canonicalPath(resolvedRoot) : null;
 
-    if (!resolvedRoot || !canonicalRoot) {
+    if (!resolvedRoot || !canonicalRoot || !isInitialized(resolvedRoot)) {
       throw new NotIndexedError(
-        `The project at ${projectPath} isn't indexed with codegraph (no .codegraph/ directory found ` +
-        'walking up from it), so codegraph cannot query it. Use your built-in tools (Read/Grep/Glob) ' +
+        `The project at ${projectPath} isn't indexed with codegraph (` +
+        (resolvedRoot ? `the nearest workspace at ${resolvedRoot} has no initialized index` : 'no .codegraph/ directory found walking up to the home boundary') +
+        '), so codegraph cannot query it. Use your built-in tools (Read/Grep/Glob) ' +
         "for that codebase instead, and don't call codegraph for it again this session. " +
         "Indexing is the user's decision — they can run 'codegraph init' in that project to enable it."
       );

@@ -1,34 +1,32 @@
 /**
- * Project-scoped configuration: a committed `codegraph.json` at the project
- * root that a team shares through version control.
+ * Project-scoped configuration: `.codegraph/config.yaml` is the local workspace
+ * config; a committed `codegraph.json` remains supported for existing projects.
+ * YAML overrides only the fields it supplies. Invalid YAML fails closed so a
+ * broken scan allowlist can never silently widen indexing to the entire root.
  *
- * Today it carries one thing — `extensions`, an opt-in map from a custom file
- * extension to one of CodeGraph's supported languages. The built-in
- * extension → language table (`EXTENSION_MAP` in `extraction/grammars.ts`) is
- * otherwise hardcoded, so a codebase that uses a non-standard extension for a
- * supported language (e.g. `.dota_lua` for Lua) sees those files silently
- * skipped. This lets the project map them once, in a version-controlled file:
- *
- *   {
- *     "extensions": {
- *       ".dota_lua": "lua",
- *       ".tpl": "php"
- *     }
- *   }
- *
- * User mappings merge on TOP of the built-ins and win on conflict, so a project
- * can also re-point a built-in extension (e.g. force `.h` → `cpp`). Absent or
- * malformed config is the zero-config default — no overrides, no error. Invalid
- * individual entries are warned-and-skipped (never fatal): an unparseable
- * project file must not break indexing.
+ * Both formats support custom extension mappings and include/exclude patterns.
+ * YAML also defines the directory allowlist and background policy. Extension
+ * mappings merge on top of the built-ins and win on conflict (for example,
+ * `.dota_lua: lua` or `.h: cpp`). Legacy JSON retains its warn-and-skip handling
+ * of malformed entries; the workspace YAML loader validates scope strictly.
  */
 import * as fs from 'fs';
 import * as path from 'path';
+import { parseDocument } from 'yaml';
 import { Language } from './types';
 import { isLanguageSupported } from './extraction/grammars';
 import { logWarn } from './errors';
+import { loadWorkspaceConfig, clearWorkspaceConfigCache, getWorkspaceConfigPath, type WorkspaceConfig } from './workspace-config';
 
-/** Filename of the project-scoped config, resolved relative to the project root. */
+export {
+  WORKSPACE_CONFIG_FILENAME, WorkspaceConfigError, getWorkspaceConfigPath,
+  ensureWorkspaceConfig, loadWorkspaceConfig, loadScanDirectories,
+  hasExplicitScanDirectories, loadBackgroundConfig, hasBackgroundConfig,
+  matchesScanDirectories,
+} from './workspace-config';
+export type { BackgroundConfig, WorkspaceConfig } from './workspace-config';
+
+/** Legacy team config filename, resolved relative to the project root. */
 export const PROJECT_CONFIG_FILENAME = 'codegraph.json';
 
 export interface ProjectConfig {
@@ -84,7 +82,7 @@ export interface ProjectConfig {
   deprioritize?: string[];
 }
 
-/** Parsed, validated view of a project's `codegraph.json`. */
+/** Parsed settings shared by legacy JSON and the local YAML overrides. */
 interface ParsedConfig {
   extensions: Record<string, Language>;
   includeIgnored: string[];
@@ -105,6 +103,7 @@ interface CacheEntry {
  * projects in the same process (the daemon / multi-project MCP server) isolated.
  */
 const cache = new Map<string, CacheEntry>();
+const mergedCache = new Map<string, { legacy: ParsedConfig; workspace: WorkspaceConfig; config: ParsedConfig }>();
 
 /** Shared frozen empties so the no-config path allocates nothing. */
 const EMPTY_EXTENSIONS: Record<string, Language> = Object.freeze({});
@@ -191,11 +190,11 @@ function extractExtensions(parsed: object, file: string): Record<string, Languag
   for (const [rawKey, rawVal] of Object.entries(exts)) {
     const key = normalizeExtKey(rawKey);
     if (!key) {
-      logWarn(`Ignoring extension mapping in ${PROJECT_CONFIG_FILENAME}: "${rawKey}" is not a valid file extension`, { file });
+      logWarn(`Ignoring extension mapping in ${path.basename(file)}: "${rawKey}" is not a valid file extension`, { file });
       continue;
     }
     if (typeof rawVal !== 'string' || !isLanguageSupported(rawVal as Language)) {
-      logWarn(`Ignoring extension "${rawKey}" in ${PROJECT_CONFIG_FILENAME}: "${String(rawVal)}" is not a supported language`, { file });
+      logWarn(`Ignoring extension "${rawKey}" in ${path.basename(file)}: "${String(rawVal)}" is not a supported language`, { file });
       continue;
     }
     out[key] = rawVal as Language;
@@ -311,7 +310,7 @@ function extractInclude(parsed: object, file: string): string[] {
  * malformed file yields the zero-config default. One `stat` (and at most one
  * read/parse) while a single config file is in force, shared across every field.
  */
-function loadParsedConfig(rootDir: string): ParsedConfig {
+function loadLegacyConfig(rootDir: string): ParsedConfig {
   const file = path.join(rootDir, PROJECT_CONFIG_FILENAME);
 
   let mtimeMs: number;
@@ -328,6 +327,29 @@ function loadParsedConfig(rootDir: string): ParsedConfig {
 
   const config = parseConfig(file);
   cache.set(rootDir, { mtimeMs, config });
+  return config;
+}
+
+function loadParsedConfig(rootDir: string): ParsedConfig {
+  // Load YAML first: a parse/validation failure must surface before falling
+  // back to a broader legacy/default scope.
+  const workspace = loadWorkspaceConfig(rootDir);
+  const legacy = loadLegacyConfig(rootDir);
+  if (!workspace) {
+    mergedCache.delete(rootDir);
+    return legacy;
+  }
+  const cached = mergedCache.get(rootDir);
+  if (cached?.legacy === legacy && cached.workspace === workspace) return cached.config;
+  const config: ParsedConfig = {
+    extensions: workspace.extensions === undefined ? legacy.extensions
+      : { ...legacy.extensions, ...extractExtensions(workspace, getWorkspaceConfigPath(rootDir)) },
+    exclude: workspace.exclude ?? legacy.exclude,
+    include: workspace.include ?? legacy.include,
+    includeIgnored: workspace.includeIgnored ?? legacy.includeIgnored,
+    deprioritize: workspace.deprioritize ?? legacy.deprioritize,
+  };
+  mergedCache.set(rootDir, { legacy, workspace, config });
   return config;
 }
 
@@ -394,6 +416,8 @@ export function loadIncludePatterns(rootDir: string): string[] {
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */
 export function clearProjectConfigCache(): void {
   cache.clear();
+  mergedCache.clear();
+  clearWorkspaceConfigCache();
 }
 
 /**
@@ -410,6 +434,24 @@ export function clearProjectConfigCache(): void {
  * index in the same process sees the new patterns.
  */
 export function addIncludeIgnoredPatterns(rootDir: string, patterns: string[]): number {
+  if (loadWorkspaceConfig(rootDir)) {
+    // A YAML override would mask edits to codegraph.json. Update the active
+    // local config and retain its comments instead of writing an inert key.
+    const file = getWorkspaceConfigPath(rootDir);
+    const existing = loadIncludeIgnoredPatterns(rootDir);
+    const merged = [...existing];
+    const seen = new Set(existing);
+    for (const pattern of patterns) {
+      if (!seen.has(pattern)) { merged.push(pattern); seen.add(pattern); }
+    }
+    const added = merged.length - existing.length;
+    if (added === 0) return 0;
+    const doc = parseDocument(fs.readFileSync(file, 'utf8'));
+    doc.set('includeIgnored', merged);
+    fs.writeFileSync(file, doc.toString());
+    clearProjectConfigCache();
+    return added;
+  }
   const file = path.join(rootDir, PROJECT_CONFIG_FILENAME);
   let config: Record<string, unknown> = {};
   let raw: string | null = null;

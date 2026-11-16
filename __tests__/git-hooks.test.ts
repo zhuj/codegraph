@@ -50,7 +50,7 @@ describe('git sync hooks', () => {
       const file = path.join(repo, '.git', 'hooks', hook);
       expect(fs.existsSync(file)).toBe(true);
       const body = fs.readFileSync(file, 'utf8');
-      expect(body).toContain('codegraph sync');
+      expect(body).toContain('codegraph sync --background --quiet');
       expect(body).toContain('command -v codegraph'); // no-op when not on PATH
       expect(isExecutable(file)).toBe(true);
     }

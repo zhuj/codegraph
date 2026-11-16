@@ -50,10 +50,10 @@ try {
   (require('node:module') as { enableCompileCache?: () => void }).enableCompileCache?.();
 } catch { /* cache is best-effort */ }
 
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
+import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeConfiguredIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -259,34 +259,13 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
 
 /**
  * Resolve project path from argument or current directory
- * Walks up parent directories to find nearest initialized CodeGraph project
- * (must have .codegraph/codegraph.db, not just .codegraph/lessons.db)
+ * Walks up to the nearest .codegraph directory, stopping at HOME inclusively.
+ * A config-only workspace must not be skipped in favor of an ancestor index.
  */
 function resolveProjectPath(pathArg?: string): string {
   const absolutePath = path.resolve(pathArg || process.cwd());
 
-  // If exact path is initialized (has codegraph.db), use it
-  if (isInitialized(absolutePath)) {
-    return absolutePath;
-  }
-
-  // Walk up to find nearest parent with CodeGraph initialized
-  // Note: findNearestCodeGraphRoot finds any .codegraph folder, but we need one with codegraph.db
-  let current = absolutePath;
-  const root = path.parse(current).root;
-
-  while (current !== root) {
-    const parent = path.dirname(current);
-    if (parent === current) break;
-    current = parent;
-
-    if (isInitialized(current)) {
-      return current;
-    }
-  }
-
-  // Not found - return original path (will fail later with helpful error)
-  return absolutePath;
+  return findNearestCodeGraphRoot(absolutePath) ?? absolutePath;
 }
 
 /**
@@ -689,7 +668,7 @@ async function runInit(
     // Refuse to index your home directory / a filesystem root — it pulls in
     // caches, other projects, and your whole tree (a multi-GB index + watcher
     // churn, and on pre-1.0 macOS a machine-crashing fd blowup, #845).
-    const unsafe = unsafeIndexRootReason(projectPath);
+    const unsafe = unsafeConfiguredIndexRootReason(projectPath);
     if (unsafe && !options.force) {
       clack.log.error(`Refusing to initialize in ${projectPath} — it looks like ${unsafe}.`);
       clack.log.info('Run this inside a specific project directory, or pass --force if you really mean to index everything under it.');
@@ -699,6 +678,8 @@ async function runInit(
     }
 
     if (isInitialized(projectPath)) {
+      const { ensureWorkspaceConfig } = await import('../workspace-config');
+      ensureWorkspaceConfig(projectPath);
       clack.log.warn(`Already initialized in ${projectPath}`);
       clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
       try {
@@ -794,7 +775,7 @@ program
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .option('-y, --yes', 'Non-interactive: skip every prompt and take the defaults (for scripts / CI / container bootstraps)')
   .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean }) => {
-    await runInit(path.resolve(pathArg || process.cwd()), options);
+    await runInit(pathArg ? path.resolve(pathArg) : resolveProjectPath(), options);
   });
 
 /**
@@ -879,7 +860,7 @@ program
     try {
       // Don't (re)index your home directory / a filesystem root (#845). --force
       // doubles as the override.
-      const unsafe = unsafeIndexRootReason(projectPath);
+      const unsafe = unsafeConfiguredIndexRootReason(projectPath);
       if (unsafe && !options.force) {
         error(`Refusing to index ${projectPath} — it looks like ${unsafe}. Pass --force to override.`);
         process.exit(1);
@@ -995,7 +976,8 @@ program
   .command('sync [path]')
   .description('Sync changes since last index')
   .option('-q, --quiet', 'Suppress output (for git hooks)')
-  .action(async (pathArg: string | undefined, options: { quiet?: boolean }) => {
+  .addOption(new Option('--background', 'Honor the workspace background policy (managed Git hooks)').hideHelp())
+  .action(async (pathArg: string | undefined, options: { quiet?: boolean; background?: boolean }) => {
     const projectPath = resolveProjectPath(pathArg);
 
     try {
@@ -1010,6 +992,11 @@ program
       const cg = await CodeGraph.open(projectPath);
 
       try {
+        if (options.background) {
+          const { runBackgroundSync } = await import('../sync/background-sync');
+          await runBackgroundSync(projectPath, () => cg.sync(), { lastIndexedAt: cg.getLastIndexedAt() });
+          return;
+        }
         if (options.quiet) {
           await cg.sync();
           return;

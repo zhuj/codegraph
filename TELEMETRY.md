@@ -1,15 +1,34 @@
 # Telemetry
 
-CodeGraph collects a small set of **anonymous usage statistics** — which commands and
+Telemetry is **off by default**, including anonymous usage statistics. Normal indexing,
+queries, CLI commands, and MCP startup collect and send no telemetry, create no telemetry
+identity or queue, and perform no background release checks.
+
+If you explicitly opt in, CodeGraph collects a small set of **anonymous usage statistics** — which commands and
 tools get used, which languages get indexed, which agents drive usage — so we can tell
 which of the 20+ languages and 8 agent integrations deserve the most work. This page is
 the complete list of what is collected. If a field isn't on this page, it isn't collected;
 the ingest endpoint enforces this list as an allowlist and is itself
 [public, auditable code](telemetry-worker/) in this repository.
 
-## Turning it off
+## Choosing whether to enable telemetry
 
-Any of these works, permanently:
+To opt in deliberately:
+
+```bash
+codegraph telemetry on         # persistent explicit choice
+export CODEGRAPH_TELEMETRY=1   # opt in for processes in this environment only
+```
+
+Only `1` or `true` enables the environment override; other non-empty values disable it.
+Removing an environment-only opt-in restores the stored choice, or the default of off.
+An old `consent_source: default-notice` record from an earlier default-on installation
+does not count as consent. A new explicit opt-in discards any old
+unconsented queue before collecting new events.
+
+To disable it:
+
+The CLI stores the choice; environment overrides apply while they are set:
 
 ```bash
 codegraph telemetry off        # stores your choice (and deletes any unsent data)
@@ -21,9 +40,10 @@ export DO_NOT_TRACK=1          # the cross-tool standard — always honored
 ```
 
 `codegraph telemetry status` shows the current state, what decided it, and your machine ID.
-The interactive installer (`codegraph install`) asks up front with a visible default-on
-toggle and never re-asks. If you never saw the installer (e.g. `npx` straight into `init`),
-a one-line notice is printed to stderr before the first time anything is sent.
+The interactive installer (`codegraph install`) offers a default-off toggle. Skipping
+the prompt, cancelling it, or using `--yes` leaves telemetry off unless you previously
+opted in. An explicit environment opt-in prints a one-line notice to stderr before
+the first send; a normal default invocation remains silent.
 
 Off means off: when disabled, CodeGraph records nothing, opens no connection to the
 telemetry endpoint, and sends no "opted out" ping. Running processes recheck the stored
@@ -35,18 +55,29 @@ request chunks and prevents its unsent data from being requeued.
 Environment overrides still apply: `CODEGRAPH_TELEMETRY=1` explicitly forces telemetry
 on for that process even when the stored choice is off; `DO_NOT_TRACK=1` takes precedence.
 
-Separately from telemetry, the MCP server checks GitHub for a newer release in the
-background (at most once a day) so it can tell you an update exists — it fetches a
-version number and sends nothing about you or your machine. `DO_NOT_TRACK=1` disables
-this check too; to turn off only the update check, use `CODEGRAPH_NO_UPDATE_CHECK=1`.
+Separately from telemetry, background GitHub release checks are also **off by default**.
+Set `CODEGRAPH_UPDATE_CHECK=1` (or `true`) to enable a check at most once a day. The
+`CODEGRAPH_NO_UPDATE_CHECK=1` and `DO_NOT_TRACK=1` overrides disable it even when enabled.
+An explicit `codegraph upgrade` still contacts the release service and downloads the
+requested update. The installer defaults to declining npm downloads and beta signup;
+those actions require an affirmative user choice.
 
-## What is collected
+The npm launcher's missing-platform-bundle recovery also stays offline by default.
+It uses an installed or cached bundle without network access. If neither is available,
+it exits with setup guidance; `CODEGRAPH_ALLOW_DOWNLOAD=1` (or `true`) explicitly enables
+the GitHub download for that invocation. `CODEGRAPH_NO_DOWNLOAD=1` takes precedence.
+
+The MCP stdio service opens no auxiliary TCP or HTTP ports. Its shared daemon, when
+used, communicates only over a local Unix-domain socket or Windows named pipe. The
+loopback HTTP viewer is a separate, explicitly invoked `codegraph ui` command.
+
+## What is collected after opting in
 
 Every payload carries this envelope:
 
 | field | example | notes |
 |---|---|---|
-| `machine_id` | `b3a8c1…` | random UUID minted on first send — derived from nothing |
+| `machine_id` | `b3a8c1…` | random UUID minted only after explicit opt-in — derived from nothing |
 | `codegraph_version` | `0.9.9` | |
 | `os` / `arch` | `darwin` / `arm64` | platform identifiers only |
 | `node_major` | `22` | major version only |

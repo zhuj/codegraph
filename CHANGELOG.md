@@ -12,6 +12,16 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Configure multiple scan directories, exclusions, and the background sync interval in `.codegraph/config.yaml`, with immediate manual `index` and `sync` commands.
+- Commands discover the nearest `.codegraph` directory or symlink up to your home directory, including a workspace whose index has not been built yet.
+- Background rescans recover missed file events and reload workspace settings without restarting the server.
+
+### Security
+
+- Anonymous telemetry and automatic update checks now require explicit opt-in, and the installer defaults to declining optional external interactions.
+- The stdio MCP server keeps its local IPC transport without exposing auxiliary TCP or HTTP ports.
 
 ## [1.6.2] - 2026-10-03
 
