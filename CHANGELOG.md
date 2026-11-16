@@ -15,12 +15,14 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### New Features
 
 - Configure multiple scan directories, exclusions, and the background sync interval in `.codegraph/config.yaml`, with immediate manual `index` and `sync` commands.
-- Commands discover the nearest `.codegraph` directory or symlink up to your home directory, including a workspace whose index has not been built yet.
+- Commands discover the nearest `.codegraph` directory or symlink below your home directory, including a workspace whose index has not been built yet.
 - Background rescans recover missed file events and reload workspace settings without restarting the server.
 
 ### Fixes
 
-- When no `.codegraph` is found up to your home directory, CLI commands, MCP startup, and prompt hooks use the current directory without automatically selecting an indexed child project.
+- When no project `.codegraph` is found below your home directory, CLI commands, MCP startup, and prompt hooks use the current directory without automatically selecting an indexed child project.
+- Per-user data in `~/.codegraph` no longer redirects project initialization to your home directory.
+- TypeScript type-only star re-exports no longer trigger false parse warnings, and type references resolve through these barrel files.
 
 ### Security
 

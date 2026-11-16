@@ -259,7 +259,7 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
 
 /**
  * Resolve project path from argument or current directory
- * Walks up to the nearest .codegraph directory, stopping at HOME inclusively.
+ * Walks up to the nearest .codegraph directory, stopping before HOME.
  * A config-only workspace must not be skipped in favor of an ancestor index.
  * Without a marker, use the requested path or the current directory.
  */

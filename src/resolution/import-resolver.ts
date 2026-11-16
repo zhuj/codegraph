@@ -1314,6 +1314,9 @@ function stripJsComments(content: string): string {
       i += 2;
       while (i < content.length && !(content[i] === '*' && content[i + 1] === '/')) i++;
       i += 2;
+      // A comment separates tokens: never join `export/**/type`, or turn
+      // `ex/**/port` into a keyword that was not present in the source.
+      out += ' ';
       continue;
     }
     out += ch;
@@ -1330,6 +1333,7 @@ function stripJsComments(content: string): string {
  *   export { foo as bar } from './a';
  *   export * from './a';
  *   export * as ns from './a';   (treated as wildcard for chasing)
+ *   export type * [as ns] from './a';   (TypeScript type-only re-export)
  *   export { default as Foo } from './a';
  *
  * The walker intentionally stays regex-based — the import-resolver
@@ -1356,8 +1360,10 @@ export function extractReExports(content: string, language: Language): ReExport[
   // out of scope.)
   const cleaned = stripJsComments(content);
 
-  // Wildcard: `export * from '...'`; `export * as ns from '...'` exports `ns` alone.
-  const wildcardRe = /export\s*\*(?:\s+as\s+([A-Za-z_$][\w$]*))?\s*from\s*['"]([^'"]+)['"]/g;
+  // Type-only exports have the same symbol forwarding shape; they do not
+  // introduce runtime imports. Preserve namespace-vs-wildcard semantics.
+  const typeModifier = language === 'typescript' || language === 'tsx' ? '(?:\\s+type)?' : '';
+  const wildcardRe = new RegExp(`export${typeModifier}\\s*\\*(?:\\s+as\\s+([A-Za-z_$][\\w$]*))?\\s*from\\s*['"]([^'"]+)['"]`, 'g');
   let m: RegExpExecArray | null;
   while ((m = wildcardRe.exec(cleaned)) !== null) {
     out.push(m[1] ? { kind: 'namespace', exportedName: m[1], source: m[2]! } : { kind: 'wildcard', source: m[2]! });

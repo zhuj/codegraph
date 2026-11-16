@@ -57,6 +57,38 @@ export function blankFlowSyntax(source: string, filePath?: string): string {
     .replace(/\.\.\.(?=\s*[},])/g, '   ');
 }
 
+/**
+ * The bundled TS grammar rejects `export type * [as Name] from '…'`.
+ * It otherwise recognizes that declaration, with just `type` inside ERROR.
+ * Blank only that AST-proven modifier, preserving every source offset. Looking
+ * at top-level export tokens avoids rewriting examples in comments, strings,
+ * templates, regexes or JSX, and leaves malformed declarations unchanged.
+ */
+export function blankTypeOnlyStarExportModifiers(source: string, root: SyntaxNode): string {
+  const positions: number[] = [];
+  for (const statement of root.namedChildren) {
+    if (statement.type !== 'export_statement' || !statement.hasError) continue;
+    const tokens = statement.children.filter((child) => child.type !== 'comment');
+    if (tokens.length !== 5 && !(tokens.length === 6 && tokens[5]!.type === ';')) continue;
+    const [exportToken, modifier, star, from, module] = tokens;
+    if (
+      exportToken?.type !== 'export' || modifier?.type !== 'ERROR' ||
+      modifier.childCount !== 1 || modifier.child(0)?.type !== 'type' ||
+      source.slice(modifier.startIndex, modifier.endIndex) !== 'type' ||
+      (star?.type !== '*' && star?.type !== 'namespace_export') ||
+      star.hasError || star.isMissing || from?.type !== 'from' || from.isMissing ||
+      module?.type !== 'string' || module.hasError || module.isMissing
+    ) continue;
+    positions.push(modifier.startIndex);
+  }
+  // Only the modifier bytes change; comments, module strings and positions survive.
+  for (let i = positions.length - 1; i >= 0; i--) {
+    const start = positions[i]!;
+    source = source.slice(0, start) + '    ' + source.slice(start + 4);
+  }
+  return source;
+}
+
 export const typescriptExtractor: LanguageExtractor = {
   preParse: blankFlowSyntax,
   functionTypes: ['function_declaration', 'generator_function_declaration', 'arrow_function', 'function_expression', 'generator_function'],

@@ -380,29 +380,36 @@ export function isSameIndexRoot(a: string, b: string): boolean {
 /**
  * Find the nearest workspace marker, including one that is not indexed yet.
  * stat follows a .codegraph symlink, while the workspace remains its parent.
- * A home-contained search includes HOME and never examines its ancestors.
+ * A home-contained search stops before HOME: its .codegraph is per-user state,
+ * not an implicit workspace for every project below it.
  * Projects outside HOME (for example /work or /tmp) stop at the filesystem root.
  */
 export function findNearestCodeGraphRoot(startPath: string): string | null {
   let current = path.resolve(startPath);
   const home = path.resolve(os.homedir());
+  const realHome = canonicalProjectRoot(home);
   const inside = (child: string, parent: string): boolean => {
     const relative = path.relative(parent, child);
     return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
   };
-  let boundary = inside(current, home) ? home : path.parse(current).root;
+  let homeBoundary = inside(current, home);
+  let boundary = homeBoundary ? home : path.parse(current).root;
   // HOME or the starting path may itself be an alias. Preserve lexical paths
   // when possible, but do not walk outside the real home through an alias.
-  if (boundary !== home) {
-    const realHome = canonicalProjectRoot(home);
+  if (!homeBoundary) {
     const realCurrent = canonicalProjectRoot(current);
     if (inside(realCurrent, realHome)) {
       current = realCurrent;
       boundary = realHome;
+      homeBoundary = true;
     }
   }
 
   while (true) {
+    if (homeBoundary && path.relative(boundary, current) === '') break;
+    // An alias can reach HOME before the lexical boundary, even when the
+    // initial path does not exist. Check directory identity at every step.
+    if (canonicalProjectRoot(current) === realHome) break;
     try {
       if (fs.statSync(getCodeGraphDir(current)).isDirectory()) return current;
     } catch {

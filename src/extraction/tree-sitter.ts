@@ -22,6 +22,7 @@ import { isGeneratedFile } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration } from './languages/c-cpp';
+import { blankTypeOnlyStarExportModifiers } from './languages/typescript';
 import { rustImplTypeName } from './languages/rust';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
@@ -617,6 +618,21 @@ export class TreeSitterExtractor {
       this.tree = parser.parse(this.source) ?? null;
       if (!this.tree) {
         throw new Error('Parser returned null tree');
+      }
+
+      // Native extraction defers errored TS/TSX parses here too. Recover only
+      // the known type-only star-export grammar gap; unrelated parse errors
+      // remain in the reparsed tree and retain the normal diagnostics below.
+      if ((this.language === 'typescript' || this.language === 'tsx') && this.tree.rootNode.hasError) {
+        const normalized = blankTypeOnlyStarExportModifiers(this.source, this.tree.rootNode);
+        if (normalized !== this.source) {
+          const reparsed = parser.parse(normalized);
+          if (reparsed) {
+            this.tree.delete();
+            this.tree = reparsed;
+            this.source = normalized;
+          }
+        }
       }
 
       // Create file node representing the source file

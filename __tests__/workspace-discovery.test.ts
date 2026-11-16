@@ -54,7 +54,7 @@ describe('nearest .codegraph workspace discovery', () => {
     });
   }
 
-  it('selects the nearest marker at any depth without requiring a database', () => {
+  it('selects the nearest marker below HOME at any depth without requiring a database', () => {
     marker(home);
     marker(workspace);
     const nearer = path.join(workspace, 'b', 'c');
@@ -66,15 +66,66 @@ describe('nearest .codegraph workspace discovery', () => {
     expect(resolveServerRoot(nested).workspaceRoot).toBe(nearer);
   });
 
-  it('includes HOME but never discovers a marker above it', () => {
+  it('stops before HOME and never discovers its marker or a marker above it', () => {
     marker(temp);
     expect(findNearestCodeGraphRoot(nested)).toBeNull();
     expect(resolveWorkspaceRoot(nested)).toBe(nested);
     expect(resolveWorkspaceRoot(home)).toBe(home);
     marker(home);
-    expect(findNearestCodeGraphRoot(nested)).toBe(home);
-    expect(findNearestCodeGraphRoot(home)).toBe(home);
-    expect(resolveWorkspaceRoot(nested)).toBe(home);
+    expect(findNearestCodeGraphRoot(nested)).toBeNull();
+    expect(findNearestCodeGraphRoot(home)).toBeNull();
+    expect(resolveWorkspaceRoot(nested)).toBe(nested);
+    expect(resolveWorkspaceRoot(home)).toBe(home);
+    expect(resolveServerRoot(nested)).toEqual({
+      workspaceRoot: nested,
+      root: null,
+      viaSubScan: false,
+      candidates: [],
+    });
+  });
+
+  it('stops before HOME when the starting directory is reached through a symlink', () => {
+    marker(home);
+    marker(temp);
+    const alias = path.join(temp, 'home-alias');
+    fs.symlinkSync(home, alias, 'junction');
+    const aliasedNested = path.join(alias, path.relative(home, nested));
+    expect(findNearestCodeGraphRoot(aliasedNested)).toBeNull();
+    expect(resolveWorkspaceRoot(aliasedNested)).toBe(aliasedNested);
+    marker(workspace);
+    expect(findNearestCodeGraphRoot(aliasedNested)).toBe(workspace);
+  });
+
+  it('stops before an alias to HOME inside HOME while retaining a nearer workspace', () => {
+    marker(home);
+    marker(temp);
+    const alias = path.join(home, 'home-link');
+    fs.symlinkSync(home, alias, 'junction');
+    const aliasedWorkspace = path.join(alias, path.relative(home, workspace));
+    const aliasedNested = path.join(alias, path.relative(home, nested));
+    expect(fs.existsSync(aliasedNested)).toBe(true);
+    expect(findNearestCodeGraphRoot(aliasedNested)).toBeNull();
+    expect(resolveWorkspaceRoot(aliasedNested)).toBe(aliasedNested);
+
+    marker(workspace);
+    expect(findNearestCodeGraphRoot(aliasedNested)).toBe(aliasedWorkspace);
+    expect(resolveWorkspaceRoot(aliasedNested)).toBe(aliasedWorkspace);
+  });
+
+  it('stops before an outside alias to HOME when the starting path does not exist', () => {
+    marker(home);
+    marker(temp);
+    const alias = path.join(temp, 'home-link');
+    fs.symlinkSync(home, alias, 'junction');
+    const aliasedWorkspace = path.join(alias, path.relative(home, workspace));
+    const missing = path.join(aliasedWorkspace, 'missing', 'deep');
+    expect(fs.existsSync(missing)).toBe(false);
+    expect(findNearestCodeGraphRoot(missing)).toBeNull();
+    expect(resolveWorkspaceRoot(missing)).toBe(missing);
+
+    marker(workspace);
+    expect(findNearestCodeGraphRoot(missing)).toBe(aliasedWorkspace);
+    expect(resolveWorkspaceRoot(missing)).toBe(aliasedWorkspace);
   });
 
   it.each([1, 2])('keeps the current directory when only %i descendant workspaces are indexed', (count) => {
@@ -156,51 +207,79 @@ describe('nearest .codegraph workspace discovery', () => {
     expect(unsafeConfiguredIndexRootReason(temp)).toContain('parent');
   });
 
-  it('CLI init falls back to cwd below HOME, then index and sync keep that workspace', () => {
-    // A marker above HOME and an indexed child are both outside the upward
-    // search. Neither may replace the current directory as the fallback.
-    marker(temp);
-    fs.writeFileSync(path.join(nested, 'package.json'), '{"private":true}');
-    const child = path.join(nested, 'service');
-    fs.mkdirSync(child);
-    CodeGraph.initSync(child).close();
-    const source = path.join(nested, 'sample.py');
-    fs.writeFileSync(source, 'def fallback_initial():\n    return 1\n');
+  it.each(['absent', 'per-user state', 'initialized', 'initialized symlink'] as const)(
+    'CLI init falls back to cwd with %s HOME data, then index and sync keep that workspace',
+    (homeData) => {
+      // HOME's per-user state, a marker above HOME, and an indexed child are all
+      // outside the project search. None may replace cwd as the fallback.
+      marker(temp);
+      const homeState = path.join(getCodeGraphDir(home), 'user-state.json');
+      if (homeData !== 'absent') {
+        if (homeData === 'initialized symlink') {
+          const storage = path.join(temp, 'home-data');
+          fs.mkdirSync(storage);
+          fs.symlinkSync(storage, getCodeGraphDir(home), 'junction');
+        } else {
+          marker(home);
+        }
+        fs.writeFileSync(homeState, '{"preserve":"per-user state"}\n');
+        if (homeData.startsWith('initialized')) CodeGraph.initSync(home).close();
+      }
+      fs.writeFileSync(path.join(nested, 'package.json'), '{"private":true}');
+      const child = path.join(nested, 'service');
+      fs.mkdirSync(child);
+      CodeGraph.initSync(child).close();
+      const source = path.join(nested, 'sample.py');
+      fs.writeFileSync(source, 'def fallback_initial():\n    return 1\n');
+      expect(resolveWorkspaceRoot(nested)).toBe(nested);
+      expect(resolveServerRoot(nested).root).toBeNull();
 
-    const beforeInit = cli(nested, ['index', '--quiet']);
-    expect(beforeInit.error).toBeUndefined();
-    expect(beforeInit.status, beforeInit.stdout + beforeInit.stderr).toBe(1);
-    expect(beforeInit.stdout + beforeInit.stderr).toContain(`not initialized in ${nested}`);
-    expect(fs.existsSync(getCodeGraphDir(nested))).toBe(false);
+      const beforeInit = cli(nested, ['index', '--quiet']);
+      expect(beforeInit.error).toBeUndefined();
+      expect(beforeInit.status, beforeInit.stdout + beforeInit.stderr).toBe(1);
+      expect(beforeInit.stdout + beforeInit.stderr).toContain(`not initialized in ${nested}`);
+      expect(fs.existsSync(getCodeGraphDir(nested))).toBe(false);
 
-    const initialized = cli(nested, ['init', '--yes']);
-    expect(initialized.error).toBeUndefined();
-    expect(initialized.status, initialized.stdout + initialized.stderr).toBe(0);
-    expect(isInitialized(nested)).toBe(true);
-    expect(fs.existsSync(path.join(getCodeGraphDir(nested), 'config.yaml'))).toBe(true);
-    expect(fs.existsSync(getCodeGraphDir(home))).toBe(false);
-    expect(fs.existsSync(getCodeGraphDir(workspace))).toBe(false);
+      const initialized = cli(nested, ['init', '--yes']);
+      expect(initialized.error).toBeUndefined();
+      expect(initialized.status, initialized.stdout + initialized.stderr).toBe(0);
+      expect(isInitialized(nested)).toBe(true);
+      expect(fs.existsSync(path.join(getCodeGraphDir(nested), 'config.yaml'))).toBe(true);
+      expect(fs.existsSync(getCodeGraphDir(home))).toBe(homeData !== 'absent');
+      expect(fs.existsSync(getCodeGraphDir(workspace))).toBe(false);
 
-    const readFunctions = (): string[] => {
-      const graph = CodeGraph.openSync(nested);
-      try { return graph.getNodesByKind('function').map((node) => node.name); }
-      finally { graph.close(); }
-    };
-    expect(readFunctions()).toEqual(['fallback_initial']);
-    fs.writeFileSync(source, 'def fallback_reindexed():\n    return 2\n');
-    const indexed = cli(nested, ['index', '--quiet']);
-    expect(indexed.error).toBeUndefined();
-    expect(indexed.status, indexed.stdout + indexed.stderr).toBe(0);
-    expect(readFunctions()).toEqual(['fallback_reindexed']);
+      const readFunctions = (root: string = nested): string[] => {
+        const graph = CodeGraph.openSync(root);
+        try { return graph.getNodesByKind('function').map((node) => node.name); }
+        finally { graph.close(); }
+      };
+      expect(readFunctions()).toEqual(['fallback_initial']);
+      fs.writeFileSync(source, 'def fallback_reindexed():\n    return 2\n');
+      const indexed = cli(nested, ['index', '--quiet']);
+      expect(indexed.error).toBeUndefined();
+      expect(indexed.status, indexed.stdout + indexed.stderr).toBe(0);
+      expect(readFunctions()).toEqual(['fallback_reindexed']);
 
-    fs.writeFileSync(source, 'def fallback_synced():\n    return 3\n');
-    const synced = cli(nested, ['sync']);
-    expect(synced.error).toBeUndefined();
-    expect(synced.status, synced.stdout + synced.stderr).toBe(0);
-    expect(readFunctions()).toEqual(['fallback_synced']);
-  }, 60_000);
+      fs.writeFileSync(source, 'def fallback_synced():\n    return 3\n');
+      const synced = cli(nested, ['sync']);
+      expect(synced.error).toBeUndefined();
+      expect(synced.status, synced.stdout + synced.stderr).toBe(0);
+      expect(readFunctions()).toEqual(['fallback_synced']);
+      expect(resolveServerRoot(nested).root).toBe(nested);
+      if (homeData !== 'absent') {
+        expect(fs.readFileSync(homeState, 'utf8')).toBe('{"preserve":"per-user state"}\n');
+        expect(isInitialized(home)).toBe(homeData.startsWith('initialized'));
+        if (homeData.startsWith('initialized')) expect(readFunctions(home)).toEqual([]);
+      }
+      if (homeData === 'initialized symlink') {
+        expect(fs.lstatSync(getCodeGraphDir(home)).isSymbolicLink()).toBe(true);
+      }
+    },
+    60_000,
+  );
 
   it('CLI init and manual sync from a deep child use the linked workspace and its scope', () => {
+    CodeGraph.initSync(home).close();
     const storage = path.join(temp, 'shared-index');
     fs.mkdirSync(storage);
     fs.symlinkSync(storage, path.join(workspace, '.codegraph'), 'junction');

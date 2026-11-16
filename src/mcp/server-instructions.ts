@@ -97,8 +97,9 @@ of the relevant symbols PLUS the call paths between them and a blast-radius
 summary — replacing a grep + Read loop with one round-trip.
 
 The default workspace is the nearest \`.codegraph/\` directory or directory
-symlink at or above the starting directory, up to HOME inclusively. If none is
-found, the starting directory itself is selected. That workspace has no initialized
+symlink at or above the starting directory, stopping before HOME. The per-user
+\`~/.codegraph\` directory is skipped; if no project marker is found, the starting
+directory itself is selected. That workspace has no initialized
 index, so the tools are available **per project** until it is initialized:
 
 - To query a project that HAS a \`.codegraph/\` index (e.g. a service inside a

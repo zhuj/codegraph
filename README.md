@@ -642,9 +642,10 @@ that drive the graph directly: `DatabaseConnection`, `QueryBuilder`,
 
 CodeGraph creates an editable `.codegraph/config.yaml` when initializing a
 workspace. Commands run from a subdirectory search upward for the **first
-`.codegraph` directory or directory symlink**, including your home directory but
-never going above it. Projects outside your home directory search up to their
-filesystem root. A nearer workspace without a built index still takes precedence;
+`.codegraph` directory or directory symlink**, stopping **before your home
+directory**. The per-user `~/.codegraph` directory is skipped. Projects outside
+your home directory search up to their filesystem root. A nearer workspace
+without a built index still takes precedence;
 run `codegraph init` there to initialize it. If no marker is found, **the current
 directory is the workspace** and `codegraph init` creates `.codegraph` there.
 CLI commands, MCP startup, and prompt hooks share this rule; indexed child
