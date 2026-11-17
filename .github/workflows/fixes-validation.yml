@@ -1,0 +1,47 @@
+name: Fix branch validation
+
+on:
+  push:
+    branches: [my/fixes-1.6.2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fixes-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CODEGRAPH_TELEMETRY: '0'
+      DO_NOT_TRACK: '1'
+      CODEGRAPH_NO_UPDATE_CHECK: '1'
+      CODEGRAPH_NO_DAEMON: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Preserve reproducible validation workspace
+        run: tar --exclude='./.git' --exclude='./.codegraph*' -czf "$RUNNER_TEMP/validation-workspace.tgz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validation-workspace
+          path: ${{ runner.temp }}/validation-workspace.tgz
+          retention-days: 1
+          compression-level: 0
+      - run: npm run build
+      - name: Progress and synthesis regressions
+        run: |
+          if [ -f scripts/tests/progress-and-synthesis.test.cjs ]; then
+            node --test scripts/tests/progress-and-synthesis.test.cjs
+          fi
+          npx --no-install vitest run --project engine __tests__/parse-pool.test.ts __tests__/workspace-config.test.ts __tests__/workspace-discovery.test.ts __tests__/callback-synthesis.test.ts __tests__/synthesis-progress.test.ts __tests__/default-offline.test.ts
