@@ -5,6 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
 import {
+  canonicalProjectRoot,
   findNearestCodeGraphRoot,
   getCodeGraphDir,
   isInitialized,
@@ -93,7 +94,9 @@ describe('nearest .codegraph workspace discovery', () => {
     expect(findNearestCodeGraphRoot(aliasedNested)).toBeNull();
     expect(resolveWorkspaceRoot(aliasedNested)).toBe(aliasedNested);
     marker(workspace);
-    expect(findNearestCodeGraphRoot(aliasedNested)).toBe(workspace);
+    // Discovery canonicalizes an outside HOME alias. On Windows that also
+    // expands 8.3 names and normalizes casing; compare the same identity.
+    expect(findNearestCodeGraphRoot(aliasedNested)).toBe(canonicalProjectRoot(workspace));
   });
 
   it('stops before an alias to HOME inside HOME while retaining a nearer workspace', () => {

@@ -8,6 +8,7 @@ import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
 import { once } from 'events';
 import { CodeGraph } from '../src';
 import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
+import { stopDaemonAt } from '../src/mcp/daemon-registry';
 import { recordSpawns, removeSpawnLog, settleLosingCandidates } from './daemon-candidates';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
@@ -72,14 +73,14 @@ describe('default offline behavior', () => {
       await closed;
     }
     await settleLosingCandidates(root, daemonPid);
-    const pid = daemonPid();
-    if (pid && pid !== process.pid) {
-      try { process.kill(pid, 'SIGTERM'); } catch { /* already stopped */ }
-      await until(() => !fs.existsSync(path.join(root, '.codegraph', 'daemon.pid')), 'daemon shutdown');
-    }
+    // Windows terminates on SIGTERM without running the daemon's JS cleanup.
+    // Use the identity-verified stop helper, which waits for process exit and
+    // removes stale artifacts on both platforms instead of waiting on a pidfile.
+    const stopped = await stopDaemonAt(fs.realpathSync(root));
+    expect(['term', 'kill', 'not-running', 'no-daemon']).toContain(stopped.outcome);
     removeSpawnLog(root);
     await fs.promises.rm(fixture, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-  });
+  }, 60_000);
 
   function launch(args: string[], overrides: NodeJS.ProcessEnv = {}) {
     const recorder = recordSpawns(root);
