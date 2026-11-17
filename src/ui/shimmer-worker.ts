@@ -1,3 +1,5 @@
+import { sampleProgressActivity } from '../progress-activity';
+import { formatProgressPath } from './progress-path';
 import { parentPort, workerData } from 'worker_threads';
 import { writeSync } from 'fs';
 import { getRawWriteGlyphs } from './glyphs';
@@ -34,6 +36,14 @@ const COLORS: boolean = workerData.colors !== false;
 const RST = COLORS ? '\x1b[0m' : '';
 const DM = COLORS ? '\x1b[2m' : '';
 const BOLD = COLORS ? '\x1b[1m' : '';
+
+// The width package is ESM-only. A real dynamic import keeps the animated CLI
+// compatible with Node 22.5 (before require(ESM) became enabled by default).
+// Until it loads, a conservative estimate keeps filenames within the viewport.
+let stringWidth = (text: string): number => Array.from(text.replace(/\x1b\[[0-9;]*m/g, ''))
+  .reduce((width, char) => width + (char.codePointAt(0)! < 128 ? 1 : 2), 0);
+const importWidth = new Function('return import("fast-string-width")') as () => Promise<{ default: (text: string) => number }>;
+void importWidth().then((module) => { stringWidth = module.default; }).catch(() => { /* retain safe estimate */ });
 
 const startTime: number = workerData.startTime;
 
@@ -83,7 +93,9 @@ function renderBar(frame: number, filled: number, empty: number): string {
 // Mutable state
 let currentMessage = '';
 let currentPercent = -1;
+let currentEpoch = -1;
 let currentCount = 0;
+let columns: number = workerData.columns || 100;
 
 function render(): void {
   if (!currentMessage) return;
@@ -92,18 +104,28 @@ function render(): void {
   const glyph = SPINNER_GLYPHS[glyphIdx] ?? SPINNER_GLYPHS[0] ?? '.';
   const color = shimmerColor(frame);
 
+  // Reserve room for a useful directory hint even on a narrow terminal.
+  // Leave one final column unused so an exact-width frame never wraps.
+  const labelRoom = Math.max(1, columns - 24);
+  const message = Array.from(currentMessage).slice(0, labelRoom).join('');
   let line: string;
   if (currentPercent >= 0) {
-    const barWidth = 25;
+    const barWidth = Math.max(1, Math.min(25, columns - stringWidth(message) - 25));
     const filled = Math.round(barWidth * currentPercent / 100);
     const empty = barWidth - filled;
-    line = `${DM}${G.rail}${RST}  ${color}${glyph}${RST} ${currentMessage}  ${renderBar(frame, filled, empty)}  ${currentPercent}%`;
+    line = `${DM}${G.rail}${RST}  ${color}${glyph}${RST} ${message}  ${renderBar(frame, filled, empty)}  ${currentPercent}%`;
   } else if (currentCount > 0) {
-    line = `${DM}${G.rail}${RST}  ${color}${glyph}${RST} ${currentMessage}... ${formatNumber(currentCount)} found`;
+    line = `${DM}${G.rail}${RST}  ${color}${glyph}${RST} ${message}... ${formatNumber(currentCount)} found`;
   } else {
-    line = `${DM}${G.rail}${RST}  ${color}${glyph}${RST} ${currentMessage}...`;
+    line = `${DM}${G.rail}${RST}  ${color}${glyph}${RST} ${message}...`;
   }
 
+  // Sample on EACH animation turn, never from a per-directory message. Worker
+  // paths stay live even while synchronous main-thread work blocks callbacks.
+  const snapshot = workerData.activity ? sampleProgressActivity(workerData.activity) : null;
+  const visible = stringWidth(line);
+  const directory = snapshot?.epoch === currentEpoch ? snapshot.directory : '.';
+  line += formatProgressPath(directory, columns - visible - 1, stringWidth);
   writeStdout(`\r\x1b[K${line}`);
 }
 
@@ -124,8 +146,11 @@ const tickInterval = setInterval(render, 50);
 parentPort!.on('message', (msg: ShimmerWorkerMessage) => {
   if (msg.type === 'update') {
     currentMessage = msg.phaseName;
+    currentEpoch = msg.epoch ?? -1;
     currentPercent = msg.percent;
     currentCount = msg.count;
+  } else if (msg.type === 'resize') {
+    columns = Math.max(1, msg.columns);
   } else if (msg.type === 'stop') {
     clearInterval(tickInterval);
     clearLine();

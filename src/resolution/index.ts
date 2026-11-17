@@ -4,6 +4,7 @@
  * Coordinates all reference resolution strategies.
  */
 
+import { reportCurrentFile, reportCurrentDirectory } from '../progress-activity';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Language, Node, UnresolvedReference, Edge } from '../types';
@@ -463,6 +464,7 @@ export class ReferenceResolver {
 
   /** `readFile` through the LRU content cache (null = read failed, also cached). */
   private readFileCached(filePath: string): string | null {
+    reportCurrentFile(filePath);
     if (this.fileCache.has(filePath)) {
       return this.fileCache.get(filePath)!;
     }
@@ -669,6 +671,7 @@ export class ReferenceResolver {
       fileContains: (filePath: string, needle: string) => this.fileContains(filePath, needle),
 
       getFileLines: (filePath: string) => {
+        reportCurrentFile(filePath);
         const cached = this.fileLinesCache.get(filePath);
         if (cached !== undefined) return cached;
         const source = this.readFileCached(filePath);
@@ -684,6 +687,7 @@ export class ReferenceResolver {
       },
 
       listDirectories: (relativePath: string) => {
+        reportCurrentDirectory(relativePath);
         const target = relativePath === '.' || relativePath === ''
           ? this.projectRoot
           : path.join(this.projectRoot, relativePath);
@@ -1758,6 +1762,7 @@ export class ReferenceResolver {
   }
 
   private resolveOneTimed(ref: UnresolvedRef): ResolvedRef | null {
+    reportCurrentFile(ref.filePath);
     if (!this.resolveProfile) return this.resolveOne(ref);
     const t0 = process.hrtime.bigint();
     const result = this.resolveOne(ref);

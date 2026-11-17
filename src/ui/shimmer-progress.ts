@@ -1,3 +1,4 @@
+import { createProgressActivity, beginActivityPhase, stopProgressActivity, activityEpoch, type ProgressActivity } from '../progress-activity';
 import { Worker } from 'worker_threads';
 import * as path from 'path';
 import { ansiColorsEnabled } from './color';
@@ -18,17 +19,19 @@ export interface IndexProgress {
 }
 
 export interface ShimmerProgress {
+  activity?: ProgressActivity;
   onProgress: (progress: IndexProgress) => void;
   stop: () => Promise<void>;
 }
 
-export function createShimmerProgress(): ShimmerProgress {
+export function createShimmerProgress(root: string = process.cwd()): ShimmerProgress {
   // Piped/redirected stdout: `\r`-rewriting animation frames are garbage in a
   // log file — emit one plain line per phase instead (#1281).
   if (process.stdout.isTTY !== true) {
     return createPlainProgress();
   }
 
+  const activity = createProgressActivity(root);
   const useColor = ansiColorsEnabled();
   const G = getGlyphs();
   const DM = useColor ? '\x1b[2m' : '';
@@ -67,11 +70,18 @@ export function createShimmerProgress(): ShimmerProgress {
   const worker = new Worker(workerPath, {
     // colors:false keeps the animation (still an interactive TTY) but drops
     // the ANSI color codes, honoring NO_COLOR / --no-color (#1281).
-    workerData: { startTime: Date.now(), colors: useColor },
+    workerData: { startTime: Date.now(), colors: useColor, activity, columns: process.stdout.columns || 100 },
   });
 
+  const onResize = (): void => worker.postMessage({ type: 'resize', columns: process.stdout.columns || 100 });
+  process.stdout.on('resize', onResize);
+  let lastSent = '';
+  let lastSentAt = 0;
   return {
+    activity,
     onProgress(progress: IndexProgress) {
+      const phaseChanged = progress.phase !== lastPhase;
+      if (phaseChanged) beginActivityPhase(activity);
       const phaseName = PHASE_NAMES[progress.phase] || progress.phase;
 
       if (progress.phase !== lastPhase && lastPhase) {
@@ -90,8 +100,16 @@ export function createShimmerProgress(): ShimmerProgress {
       lastPercent = percent;
       lastCount = count;
 
+      // Path producers never post messages. Percent/count updates are coalesced
+      // too; the animation renders independently at 20fps even when we are busy.
+      const state = `${progress.phase}:${percent}:${count}`;
+      const now = Date.now();
+      if (!phaseChanged && (state === lastSent || now - lastSentAt < 50)) return;
+      lastSent = state;
+      lastSentAt = now;
       worker.postMessage({
         type: 'update',
+        epoch: activityEpoch(activity),
         phase: progress.phase,
         phaseName,
         percent,
@@ -100,6 +118,8 @@ export function createShimmerProgress(): ShimmerProgress {
     },
 
     stop() {
+      stopProgressActivity(activity);
+      process.stdout.off('resize', onResize);
       return new Promise<void>((resolve) => {
         let settled = false;
         const finish = (): void => {

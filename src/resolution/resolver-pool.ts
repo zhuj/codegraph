@@ -9,6 +9,7 @@
  * back to the sequential path. Kill switch: CODEGRAPH_NO_PARALLEL_RESOLVE=1.
  */
 
+import { workerActivity, invalidateWorkerActivity, type WorkerActivity } from '../progress-activity';
 import { Worker } from 'worker_threads';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -33,6 +34,8 @@ export interface ChunkResult {
 }
 
 interface PoolWorker {
+  activitySlot: number;
+  activity?: WorkerActivity;
   worker: Worker;
   ready: Promise<void>;
   /** Settles on the worker's first message or its end — see worker-teardown.ts. */
@@ -179,7 +182,7 @@ export class ResolverPool {
         readyResolve = resolve;
         readyReject = reject;
       });
-      const pw: PoolWorker = { worker, ready, started, busy: 0 };
+      const pw: PoolWorker = { worker, ready, started, busy: 0, activitySlot: 17 + i };
       worker.on('message', (msg: { type: string; id?: number; message?: string; edges?: Edge[]; ms?: number } & Partial<ChunkResult>) => {
         if (msg.type === 'ready') {
           readyResolve();
@@ -235,6 +238,7 @@ export class ResolverPool {
   }
 
   private fail(err: Error): void {
+    for (const pw of this.workers) invalidateWorkerActivity(pw.activity);
     if (!this.failed) this.failed = err;
     for (const [, waiter] of this.waiters) waiter.reject(this.failed);
     this.waiters.clear();
@@ -278,7 +282,8 @@ export class ResolverPool {
       chunkPromises.push(
         new Promise<ChunkResult>((resolve, reject) => {
           this.waiters.set(id, { resolve, reject });
-          pw.worker.postMessage({ type: 'resolve', id, refs: chunk });
+          pw.activity = workerActivity(pw.activitySlot);
+          pw.worker.postMessage({ type: 'resolve', id, refs: chunk, activity: pw.activity });
         })
       );
     }
@@ -307,7 +312,8 @@ export class ResolverPool {
     pw.busy++;
     return new Promise<SynthPassResult>((resolve, reject) => {
       this.synthWaiters.set(id, { resolve, reject });
-      pw.worker.postMessage({ type: 'synth', id, pass: passName });
+      pw.activity = workerActivity(pw.activitySlot);
+      pw.worker.postMessage({ type: 'synth', id, pass: passName, activity: pw.activity });
     });
   }
 
@@ -355,6 +361,7 @@ export class ResolverPool {
    * booted, on a busy machine, can have a worker still loading its modules.
    */
   async destroy(closeTimeoutMs = CLOSE_TIMEOUT_MS): Promise<void> {
+    for (const pw of this.workers) invalidateWorkerActivity(pw.activity);
     await Promise.all(
       this.workers.map(
         (pw) =>

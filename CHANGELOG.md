@@ -14,6 +14,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- Animated indexing and sync progress shows the current directory in brackets without redrawing for every file or directory change.
+- Dynamic-dispatch linking reuses bounded source-line offsets and avoids unnecessary language scans and large temporary edge arrays.
+
 - Configure multiple scan directories, exclusions, and the background sync interval in `.codegraph/config.yaml`, with immediate manual `index` and `sync` commands.
 - Commands discover the nearest `.codegraph` directory or symlink below your home directory, including a workspace whose index has not been built yet.
 - Background rescans recover missed file events and reload workspace settings without restarting the server.

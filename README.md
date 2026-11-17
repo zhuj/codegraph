@@ -549,6 +549,48 @@ codegraph version                 # Print the installed version (also -v, --vers
 codegraph help [command]          # Show help, optionally for one command
 ```
 
+### Indexing progress and linking performance
+
+Interactive `init`, `index`, and `sync` show the directory currently being
+processed next to the phase gauge, for example:
+
+```text
+│  ◆ Parsing code               ━━━━━━━━━━━━━────────────  52% [src/schemas]
+│  ◆ Linking dynamic dispatch   ━━━━━━━━━━━━━━━━━────────  68% [src/subsystems]
+```
+
+Paths are relative to the selected workspace. `[.]` means the workspace root or
+an operation over the whole graph. With parallel workers, the hint is the most
+recently updated **active** worker's directory, not the last completed file or
+one waiting in the queue. Finished and failed workers stop contributing a path.
+
+Directory changes only update bounded shared state. The existing animation loop
+samples that state every 50 milliseconds, including when the main thread is busy;
+no per-directory messages, terminal writes, locks, or waits are added. Long paths
+are abbreviated to fit and terminal control characters are escaped. Redirected
+output keeps the existing plain, per-phase log format.
+
+Linking retains its existing passes, coverage, ordering and confidence rules.
+Source-line slicing uses a bounded per-context cache, callback dispatchers are
+looked up by channel rather than repeatedly scanning the whole candidate list,
+and the final edge merge avoids an extra flattened copy of every pass result.
+
+To diagnose the remaining expensive passes on a particular project:
+
+```bash
+CODEGRAPH_SYNTH_TIMINGS=1 codegraph index
+```
+
+The local synthetic hotspot benchmark can be run against two built revisions:
+
+```bash
+node scripts/benchmark-synthesis-tail.cjs /path/to/baseline/dist
+node scripts/benchmark-synthesis-tail.cjs /path/to/updated/dist
+```
+
+Compare the output edge digests as well as timings. These isolated pass timings
+are not a promise of the same speedup for a complete project index.
+
 ### `codegraph affected`
 
 Traces import dependencies transitively to find which test files are affected by changed source files.

@@ -5,6 +5,7 @@
  * knowledge graph from any codebase.
  */
 
+import { withProgressActivity, type ProgressActivity } from './progress-activity';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
@@ -125,6 +126,9 @@ export interface OpenOptions {
  * Options for indexing
  */
 export interface IndexOptions {
+  /** Optional console activity channel; never affects indexing or graph results. */
+  activity?: ProgressActivity;
+
   /** Progress callback */
   onProgress?: (progress: IndexProgress) => void;
 
@@ -520,7 +524,7 @@ export class CodeGraph {
    * Uses a mutex to prevent concurrent indexing operations.
    */
   async indexAll(options: IndexOptions = {}): Promise<IndexResult> {
-    return this.indexMutex.withLock(async () => {
+    return this.indexMutex.withLock(() => withProgressActivity(options.activity, async () => {
       try {
         this.fileLock.acquire();
       } catch {
@@ -803,7 +807,7 @@ export class CodeGraph {
         }
         this.fileLock.release();
       }
-    });
+    }));
   }
 
   /**
@@ -833,7 +837,7 @@ export class CodeGraph {
    * Uses a mutex to prevent concurrent indexing operations.
    */
   async sync(options: IndexOptions = {}): Promise<SyncResult> {
-    return this.indexMutex.withLock(async () => {
+    return this.indexMutex.withLock(() => withProgressActivity(options.activity, async () => {
       try {
         this.fileLock.acquire();
       } catch (err) {
@@ -1165,7 +1169,7 @@ export class CodeGraph {
         }
         this.fileLock.release();
       }
-    });
+    }));
   }
 
   /**

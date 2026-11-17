@@ -20,6 +20,7 @@ try {
   (require('node:module') as { enableCompileCache?: () => void }).enableCompileCache?.();
 } catch { /* cache is best-effort */ }
 
+import { withWorkerActivity, clearCurrentActivity, type WorkerActivity } from '../progress-activity';
 import { parentPort, threadId } from 'worker_threads';
 import { createDatabase, SqliteDatabase } from '../db/sqlite-adapter';
 import { QueryBuilder } from '../db/queries';
@@ -41,8 +42,8 @@ let resolver: ReferenceResolver | null = null;
 type InMessage =
   | { type: 'open'; dbPath: string; projectRoot: string }
   | { type: 'recycle'; id: number }
-  | { type: 'resolve'; id: number; refs: UnresolvedReference[] }
-  | { type: 'synth'; id: number; pass: string }
+  | { type: 'resolve'; id: number; refs: UnresolvedReference[]; activity?: WorkerActivity }
+  | { type: 'synth'; id: number; pass: string; activity?: WorkerActivity }
   | { type: 'close' };
 
 let dbPath: string | null = null;
@@ -87,7 +88,11 @@ port.on('message', (msg: InMessage) => {
       case 'resolve': {
         if (!resolver) throw new Error('resolver-worker: resolve before open');
         const tRes = Date.now();
-        const out = resolver.resolveListForAdmission(msg.refs);
+        const activeResolver = resolver;
+        const out = withWorkerActivity(msg.activity, () => {
+          try { return activeResolver.resolveListForAdmission(msg.refs); }
+          finally { clearCurrentActivity(); }
+        });
         if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker resolve: ${msg.refs.length} refs in ${Date.now() - tRes}ms`);
         port.postMessage({ type: 'result', id: msg.id, ...out });
         break;
@@ -106,7 +111,10 @@ port.on('message', (msg: InMessage) => {
         void (async () => {
           const t0 = Date.now();
           try {
-            const edges = await pass.run(q, r.getResolutionContext(), createYielder());
+            const edges = await withWorkerActivity(msg.activity, async () => {
+              try { return await pass.run(q, r.getResolutionContext(), createYielder()); }
+              finally { clearCurrentActivity(); }
+            });
             port.postMessage({ type: 'synth-result', id: msg.id, edges, ms: Date.now() - t0 });
           } catch (err) {
             port.postMessage({

@@ -4,6 +4,7 @@
  * Coordinates file scanning, parsing, and database storage.
  */
 
+import { reportCurrentFile, reportCurrentDirectory } from '../progress-activity';
 import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import * as path from 'path';
@@ -1151,6 +1152,7 @@ function lsFilesStaged(gitOpts: Parameters<typeof execFileSync>[2]): string {
  * parent's own gitignore rules.
  */
 function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, embeddedRoots?: Set<string>, includeIgnored: Ignore | null = null, selected: readonly string[] = ['.']): void {
+  reportCurrentDirectory(repoDir);
   if (!matchesScanDirectories(prefix, selected, true)) return;
   const gitOpts = { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'], windowsHide: true };
 
@@ -1258,6 +1260,7 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
  * (non-git project) so callers can fall back to a filesystem walk.
  */
 function getGitVisibleFiles(rootDir: string): Set<string> | null {
+  reportCurrentDirectory(rootDir);
   try {
     // Check if the project directory is gitignored by a parent repo.
     // When rootDir lives inside a parent git repo that ignores it,
@@ -1435,6 +1438,7 @@ export function canTrustGitFastPath(rootDir: string, sinceCommit?: string | null
 }
 
 function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>, includeIgnored: Ignore | null = null, exclude: Ignore | null = null, sinceCommit?: string, selected: readonly string[] = ['.']): void {
+  reportCurrentDirectory(repoDir);
   if (!matchesScanDirectories(prefix, selected, true)) return;
   const output = execFileSync(
     'git',
@@ -1558,6 +1562,7 @@ export function scanDirectory(
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
+      reportCurrentFile(filePath);
       if (isSourceFile(filePath, overrides)) {
         files.push(filePath);
         count++;
@@ -1609,6 +1614,7 @@ export async function scanDirectoryAsync(
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
+      reportCurrentFile(filePath);
       if (isSourceFile(filePath, overrides)) {
         files.push(filePath);
         count++;
@@ -1673,6 +1679,7 @@ function scanDirectoryWalk(
   };
 
   function walk(dir: string, matchers: ScopedIgnore[]): void {
+    reportCurrentDirectory(dir);
     let realDir: string;
     try {
       realDir = fs.realpathSync(dir);
@@ -1707,6 +1714,7 @@ function scanDirectoryWalk(
       if (entry.name === '.git' || isCodeGraphDataDir(entry.name)) continue;
 
       const fullPath = path.join(dir, entry.name);
+      reportCurrentFile(fullPath);
       const relativePath = normalizePath(path.relative(rootDir, fullPath));
 
       if (entry.isSymbolicLink()) {
@@ -2297,7 +2305,10 @@ export class ExtractionOrchestrator {
     const parseFile = (filePath: string, content: string): Promise<ExtractionResult> => {
       const language = detectLanguage(filePath, content, overrides);
       const names = this.frameworksForFile(filePath, frameworkNames);
-      if (!pool) return Promise.resolve(extractFromSource(filePath, content, language, names));
+      if (!pool) {
+        reportCurrentFile(filePath);
+        return Promise.resolve(extractFromSource(filePath, content, language, names));
+      }
       return pool.requestParse({ filePath, content, language, frameworkNames: names });
     };
 
@@ -2940,6 +2951,7 @@ export class ExtractionOrchestrator {
     // otherwise detect on the spot so single-file re-index paths still emit
     // route nodes / middleware / etc.
     const frameworkNames = this.frameworksForFile(relativePath, this.ensureDetectedFrameworks());
+    reportCurrentFile(relativePath);
     const result = extractFromSource(relativePath, content, language, frameworkNames);
 
     // Store in database
@@ -3410,7 +3422,9 @@ export class ExtractionOrchestrator {
       // `.gitignore` / exclude-standard change that forced this full sync is
       // visible to the next scoped sync (#1728).
       this.scopedMatcher = null;
-      currentFiles = await scanDirectoryAsync(this.rootDir);
+      currentFiles = await scanDirectoryAsync(this.rootDir, (current, file) => {
+        onProgress?.({ phase: 'scanning', current, total: 0, currentFile: file });
+      });
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scan: ${Date.now() - tSyncScan}ms (${currentFiles.length} files)`);
       filesChecked = currentFiles.length;
 
@@ -3459,6 +3473,7 @@ export class ExtractionOrchestrator {
       filesRemoved++;
     };
     for (const tracked of trackedFiles) {
+      reportCurrentFile(tracked.path);
       if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
         removeTracked(tracked);
       }
@@ -3469,6 +3484,7 @@ export class ExtractionOrchestrator {
 
     // Adds / modifications.
     for (const filePath of currentFiles) {
+      reportCurrentFile(filePath);
       // Same cooperative yield as the removals loop — this is the other O(files)
       // synchronous-stat loop that wedges the main thread on a large repo (#905).
       // Yield at the top of the body so the `continue` fast-paths below still hit it.
@@ -3708,6 +3724,7 @@ export class ExtractionOrchestrator {
 
     // Find removed files
     for (const tracked of trackedFiles) {
+      reportCurrentFile(tracked.path);
       if (!currentFiles.has(tracked.path)) {
         removed.push(tracked.path);
       }
@@ -3715,6 +3732,7 @@ export class ExtractionOrchestrator {
 
     // Find added and modified files
     for (const filePath of currentFiles) {
+      reportCurrentFile(filePath);
       const fullPath = path.join(this.rootDir, filePath);
       let content: string | null;
       try {

@@ -729,9 +729,8 @@ async function runInit(
           return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
         }
         process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-        const progress = createShimmerProgress();
-        const r = await cg.indexAll({ onProgress: progress.onProgress });
-        await progress.stop();
+        const progress = createShimmerProgress(projectPath);
+        const r = await cg.indexAll({ onProgress: progress.onProgress, activity: progress.activity }).finally(() => progress.stop());
         return r;
       } finally {
         supervision.stop();
@@ -929,9 +928,8 @@ program
                 return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
               }
               process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-              const progress = createShimmerProgress();
-              const r = await cg.indexAll({ onProgress: progress.onProgress });
-              await progress.stop();
+              const progress = createShimmerProgress(projectPath);
+              const r = await cg.indexAll({ onProgress: progress.onProgress, activity: progress.activity }).finally(() => progress.stop());
               return r;
             };
 
@@ -1005,10 +1003,11 @@ program
         clack.intro('Syncing CodeGraph');
 
         process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-        const progress = createShimmerProgress();
+        const progress = createShimmerProgress(projectPath);
 
         const result = await cg.sync({
           onProgress: progress.onProgress,
+          activity: progress.activity,
         }).finally(() => progress.stop());
 
         const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
