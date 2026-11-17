@@ -14,13 +14,19 @@ concurrency:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
       CODEGRAPH_TELEMETRY: '0'
       DO_NOT_TRACK: '1'
       CODEGRAPH_NO_UPDATE_CHECK: '1'
       CODEGRAPH_NO_DAEMON: '1'
+      CODEGRAPH_PARSE_WORKERS: '2'
+      CODEGRAPH_RESOLVE_WORKERS: '2'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,18 +36,22 @@ jobs:
           node-version: '22'
           cache: npm
       - run: npm ci --no-audit --no-fund
-      - name: Preserve reproducible validation workspace
-        run: tar --exclude='./.git' --exclude='./.codegraph*' -czf "$RUNNER_TEMP/validation-workspace.tgz" .
-      - uses: actions/upload-artifact@v4
-        with:
-          name: validation-workspace
-          path: ${{ runner.temp }}/validation-workspace.tgz
-          retention-days: 1
-          compression-level: 0
       - run: npm run build
-      - name: Progress and synthesis regressions
-        run: |
-          if [ -f scripts/tests/progress-and-synthesis.test.cjs ]; then
-            node --test scripts/tests/progress-and-synthesis.test.cjs
-          fi
-          npx --no-install vitest run --project engine __tests__/parse-pool.test.ts __tests__/workspace-config.test.ts __tests__/workspace-discovery.test.ts __tests__/callback-synthesis.test.ts __tests__/synthesis-progress.test.ts __tests__/default-offline.test.ts
+      - name: Progress, synthesis, sync, workspace and offline regressions
+        shell: bash
+        run: >-
+          npx --no-install vitest run --project engine --maxWorkers=2 --minWorkers=1
+          __tests__/progress-activity.test.ts
+          __tests__/synthesis-optimizations.test.ts
+          __tests__/synthesis-progress.test.ts
+          __tests__/synthesis-tail-scaling.test.ts
+          __tests__/closure-collection-synthesizer.test.ts
+          __tests__/fabric-view.test.ts
+          __tests__/migrations-synthesis-json.test.ts
+          __tests__/sync-rebuild-convergence.test.ts
+          __tests__/parse-pool.test.ts
+          __tests__/cli-no-color.test.ts
+          __tests__/cli-sync.test.ts
+          __tests__/workspace-config.test.ts
+          __tests__/workspace-discovery.test.ts
+          __tests__/default-offline.test.ts
