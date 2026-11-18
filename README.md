@@ -564,11 +564,16 @@ an operation over the whole graph. With parallel workers, the hint is the most
 recently updated **active** worker's directory, not the last completed file or
 one waiting in the queue. Finished and failed workers stop contributing a path.
 
-Directory changes only update bounded shared state. The existing animation loop
-samples that state every 50 milliseconds, including when the main thread is busy;
-no per-directory messages, terminal writes, locks, or waits are added. Long paths
-are abbreviated to fit and terminal control characters are escaped. Redirected
-output keeps the existing plain, per-phase log format.
+Directory, phase, count, and percentage changes only update stored state. The
+animation samples the latest values once per existing 150-millisecond shimmer
+tick, including when the main thread is busy; the star's shape still changes
+every third tick. With colors disabled, only those star-shape changes redraw the
+gauge. Processing never triggers a redraw or sends a progress message,
+and there is no separate path or count refresh timer. Updates between ticks are
+coalesced without losing the latest value. Completed-phase lines are buffered and
+printed once when the operation finishes. Long paths are abbreviated to fit and
+terminal control characters are escaped. Redirected output keeps the existing
+plain, per-phase log format.
 
 Linking retains its existing passes, coverage, ordering and confidence rules.
 Source-line slicing uses a bounded per-context cache, callback dispatchers are

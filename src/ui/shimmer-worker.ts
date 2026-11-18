@@ -4,6 +4,8 @@ import { parentPort, workerData } from 'worker_threads';
 import { writeSync } from 'fs';
 import { getRawWriteGlyphs } from './glyphs';
 import type { ShimmerWorkerMessage } from './types';
+import { ShimmerState } from './shimmer-state';
+import { collectBeforeExit } from '../worker-teardown';
 
 // Write directly to fd 1 (stdout) instead of writeStdout().
 // In Node.js worker threads, process.stdout is proxied through the main
@@ -43,7 +45,8 @@ const BOLD = COLORS ? '\x1b[1m' : '';
 let stringWidth = (text: string): number => Array.from(text.replace(/\x1b\[[0-9;]*m/g, ''))
   .reduce((width, char) => width + (char.codePointAt(0)! < 128 ? 1 : 2), 0);
 const importWidth = new Function('return import("fast-string-width")') as () => Promise<{ default: (text: string) => number }>;
-void importWidth().then((module) => { stringWidth = module.default; }).catch(() => { /* retain safe estimate */ });
+const widthReady = importWidth().then((module) => { stringWidth = module.default; })
+  .catch(() => { /* retain safe estimate */ });
 
 const startTime: number = workerData.startTime;
 
@@ -96,10 +99,26 @@ let currentPercent = -1;
 let currentEpoch = -1;
 let currentCount = 0;
 let columns: number = workerData.columns || 100;
+const progress = new ShimmerState(workerData.progress);
+let lastFrame = -1;
 
 function render(): void {
-  if (!currentMessage) return;
   const frame = animFrame();
+  // Only an animation change may sample process state or write a running
+  // gauge. A context change must never cause an extra frame.
+  // Without colors the star's shape is the only visible animation, so even
+  // the intermediate shimmer ticks stay silent until that shape advances.
+  const visibleFrame = COLORS ? frame : Math.floor(frame / FRAMES_PER_GLYPH);
+  if (visibleFrame === lastFrame) return;
+  lastFrame = visibleFrame;
+  const latest = progress.sample();
+  if (latest) {
+    currentMessage = latest.phaseName;
+    currentEpoch = latest.epoch;
+    currentPercent = latest.percent;
+    currentCount = latest.count;
+  }
+  if (!currentMessage) return;
   const glyphIdx = Math.floor(frame / FRAMES_PER_GLYPH) % SPINNER_GLYPHS.length;
   const glyph = SPINNER_GLYPHS[glyphIdx] ?? SPINNER_GLYPHS[0] ?? '.';
   const color = shimmerColor(frame);
@@ -140,20 +159,23 @@ function clearLine(): void {
   currentCount = 0;
 }
 
-// Render loop — independent of main thread
-const tickInterval = setInterval(render, 50);
+// One clock, at the existing shimmer cadence. The star's shape still changes
+// every three frames (450ms). No separate path/count refresh or 50ms redraws.
+const tickInterval = setInterval(render, ANIM_INTERVAL);
 
 parentPort!.on('message', (msg: ShimmerWorkerMessage) => {
-  if (msg.type === 'update') {
-    currentMessage = msg.phaseName;
-    currentEpoch = msg.epoch ?? -1;
-    currentPercent = msg.percent;
-    currentCount = msg.count;
-  } else if (msg.type === 'resize') {
+  if (msg.type === 'resize') {
     columns = Math.max(1, msg.columns);
   } else if (msg.type === 'stop') {
     clearInterval(tickInterval);
     clearLine();
-    parentPort!.postMessage({ type: 'stopped' });
+    void widthReady.then(() => {
+      collectBeforeExit();
+      parentPort!.postMessage({ type: 'stopped' });
+    });
   }
 });
+
+// Include the asynchronous width import: the owner must not terminate while
+// modules are still loading, even if stop arrived before the first frame.
+void widthReady.then(() => parentPort!.postMessage({ type: 'ready' }));

@@ -42,6 +42,9 @@ jobs:
         run: >-
           npx --no-install vitest run --project engine --maxWorkers=2 --minWorkers=1
           __tests__/progress-activity.test.ts
+          __tests__/shimmer-progress.test.ts
+          __tests__/glyphs.test.ts
+          __tests__/worker-teardown.test.ts
           __tests__/synthesis-optimizations.test.ts
           __tests__/synthesis-progress.test.ts
           __tests__/synthesis-tail-scaling.test.ts

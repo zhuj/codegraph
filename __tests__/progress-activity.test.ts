@@ -126,8 +126,8 @@ describe('sampled current-directory activity', () => {
         await withProgressActivity(ui.activity, async () => {
           ui.onProgress({phase:'linking', current:1, total:10});
           await new Promise(resolve => setTimeout(resolve, 200));
-          reportCurrentDirectory('during/first'); busy(250);
-          reportCurrentDirectory('during/second'); busy(250);
+          reportCurrentDirectory('during/first'); busy(450);
+          reportCurrentDirectory('during/second'); busy(450);
           // There is no onProgress or postMessage between these directory writes.
         });
         await ui.stop();
@@ -140,7 +140,7 @@ describe('sampled current-directory activity', () => {
     });
     expect(result.error).toBeUndefined();
     expect(result.status, result.stderr).toBe(0);
-    expect(result.stderr).toContain('updates=1');
+    expect(result.stderr).toContain('updates=0');
     expect(result.stdout).toContain('[during/first]');
     expect(result.stdout).toContain('[during/second]');
   }, 20_000);

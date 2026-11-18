@@ -23,6 +23,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Animated progress refreshes paths, counts, and phases only when its animation advances, keeping terminal output calm during fast scanning and indexing.
 - When no project `.codegraph` is found below your home directory, CLI commands, MCP startup, and prompt hooks use the current directory without automatically selecting an indexed child project.
 - Per-user data in `~/.codegraph` no longer redirects project initialization to your home directory.
 - TypeScript type-only star re-exports no longer trigger false parse warnings, and type references resolve through these barrel files.

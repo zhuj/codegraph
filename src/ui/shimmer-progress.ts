@@ -3,6 +3,9 @@ import { Worker } from 'worker_threads';
 import * as path from 'path';
 import { ansiColorsEnabled } from './color';
 import { getGlyphs } from './glyphs';
+import { ShimmerState, type ShimmerSnapshot } from './shimmer-state';
+import { workerStarted, terminateOnceStarted } from '../worker-teardown';
+import type { ShimmerMainMessage } from './types';
 
 const PHASE_NAMES: Record<string, string> = {
   scanning: 'Scanning files',
@@ -39,56 +42,51 @@ export function createShimmerProgress(root: string = process.cwd()): ShimmerProg
   const RST = useColor ? '\x1b[0m' : '';
 
   let lastPhase = '';
-  let lastPhaseName = '';
-  let lastPercent = -1;
-  let lastCount = 0;
+  let latest: ShimmerSnapshot | undefined;
+  const completed: ShimmerSnapshot[] = [];
+  const state = new ShimmerState();
+  let stopping: Promise<void> | undefined;
 
-  // The persistent "phase done" lines — the ones that stay in scrollback —
-  // are printed HERE, on the main thread, not by the worker. process.stdout
-  // reaches a Windows console through the wide-char API, so these lines can
-  // carry the same Unicode glyphs @clack/prompts draws around them (#398);
-  // the worker's raw fs.writeSync path can't (codepage mojibake, #168) and is
-  // now used only for the transient, self-erasing animation frames. The main
-  // thread is guaranteed alive here: phase changes arrive via its own
-  // progress callback.
-  const printPhaseDone = (): void => {
-    if (!lastPhaseName) return;
-    let detail = '';
-    if (lastPercent >= 0) detail = ` ${G.dash} done`;
-    else if (lastCount > 0) detail = ` ${G.dash} ${lastCount.toLocaleString()} found`;
-    // Leading \r + erase clears the worker's in-flight animation line; one
-    // atomic write so a worker frame can't interleave mid-line.
-    process.stdout.write(
-      `\r\x1b[K${DM}${G.rail}${RST}  ${GRN}${G.phaseDone}${RST} ${lastPhaseName}${detail}\n`
-    );
-    lastPhaseName = '';
-    lastPercent = -1;
-    lastCount = 0;
+  // Phase transitions only queue summaries. Flush once, after the animation
+  // stops, so processing never triggers terminal output. Keep persistent text
+  // on the main thread's Windows-aware stdout path (#398 / #168).
+  const printCompletedPhases = (): void => {
+    if (latest) completed.push(latest);
+    latest = undefined;
+    if (!completed.length) return;
+    const lines = completed.map(({ phaseName, percent, count }) => {
+      const detail = percent >= 0 ? ` ${G.dash} done`
+        : count > 0 ? ` ${G.dash} ${count.toLocaleString()} found` : '';
+      return `${DM}${G.rail}${RST}  ${GRN}${G.phaseDone}${RST} ${phaseName}${detail}\n`;
+    });
+    process.stdout.write(`\r\x1b[K${lines.join('')}`);
+    completed.length = 0;
   };
 
   const workerPath = path.join(__dirname, 'shimmer-worker.js');
   const worker = new Worker(workerPath, {
     // colors:false keeps the animation (still an interactive TTY) but drops
     // the ANSI color codes, honoring NO_COLOR / --no-color (#1281).
-    workerData: { startTime: Date.now(), colors: useColor, activity, columns: process.stdout.columns || 100 },
+    workerData: {
+      startTime: Date.now(), colors: useColor, activity,
+      progress: state.buffer, columns: process.stdout.columns || 100,
+    },
   });
+  const started = workerStarted(worker);
 
   const onResize = (): void => worker.postMessage({ type: 'resize', columns: process.stdout.columns || 100 });
   process.stdout.on('resize', onResize);
-  let lastSent = '';
-  let lastSentAt = 0;
   return {
     activity,
     onProgress(progress: IndexProgress) {
+      if (stopping) return;
       const phaseChanged = progress.phase !== lastPhase;
-      if (phaseChanged) beginActivityPhase(activity);
-      const phaseName = PHASE_NAMES[progress.phase] || progress.phase;
-
-      if (progress.phase !== lastPhase && lastPhase) {
-        printPhaseDone();
+      if (phaseChanged) {
+        if (latest) completed.push(latest);
+        beginActivityPhase(activity);
       }
+      const phaseName = PHASE_NAMES[progress.phase] || progress.phase;
       lastPhase = progress.phase;
-      lastPhaseName = phaseName;
 
       let percent = -1;
       let count = 0;
@@ -97,53 +95,45 @@ export function createShimmerProgress(root: string = process.cwd()): ShimmerProg
       } else if (progress.current > 0) {
         count = progress.current;
       }
-      lastPercent = percent;
-      lastCount = count;
-
-      // Path producers never post messages. Percent/count updates are coalesced
-      // too; the animation renders independently at 20fps even when we are busy.
-      const state = `${progress.phase}:${percent}:${count}`;
-      const now = Date.now();
-      if (!phaseChanged && (state === lastSent || now - lastSentAt < 50)) return;
-      lastSent = state;
-      lastSentAt = now;
-      worker.postMessage({
-        type: 'update',
+      latest = {
         epoch: activityEpoch(activity),
-        phase: progress.phase,
         phaseName,
         percent,
         count,
-      });
+      };
+      // Retain even the last update in a burst. Only the animation clock reads
+      // this slot: no progress messages, timers, stdout writes or dropped tail.
+      state.update(latest);
     },
 
     stop() {
+      if (stopping) return stopping;
       stopProgressActivity(activity);
       process.stdout.off('resize', onResize);
-      return new Promise<void>((resolve) => {
+      stopping = new Promise<void>((resolve) => {
         let settled = false;
         const finish = (): void => {
           if (settled) return;
           settled = true;
-          // Worker has cleared (or been terminated off) the animation line;
-          // persist the final phase's done-line from the main thread.
-          printPhaseDone();
-          resolve();
+          clearTimeout(timeout);
+          worker.off('message', onMessage);
+          void terminateOnceStarted(worker, started).then(() => {
+            // The worker can no longer race these persistent completion lines.
+            printCompletedPhases();
+            resolve();
+          });
         };
 
-        const timeout = setTimeout(() => {
-          worker.terminate().then(finish);
-        }, 2000);
+        const timeout = setTimeout(finish, 2000);
 
-        worker.on('message', (msg: { type: string }) => {
-          if (msg.type === 'stopped') {
-            clearTimeout(timeout);
-            worker.terminate().then(finish);
-          }
-        });
+        const onMessage = (msg: ShimmerMainMessage): void => {
+          if (msg.type === 'stopped') finish();
+        };
+        worker.on('message', onMessage);
 
         worker.postMessage({ type: 'stop' });
       });
+      return stopping;
     },
   };
 }
