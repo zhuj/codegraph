@@ -335,6 +335,7 @@ export class EventHub {
         return { filesChanged: 0, durationMs: 0 };
       },
       {
+        backgroundSync: false,
         debounceMs: SOURCE_DEBOUNCE_MS,
         onDegraded: (reason) => {
           this.degraded = reason;

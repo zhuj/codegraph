@@ -28,6 +28,7 @@ import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs } from './languages/dart';
 import { cfmlConstructedComponent, cfmlCreatedComponent, isCfIncludeCall } from './languages/cfscript';
+import { blankTypeOnlyStarExportModifiers } from './languages/typescript';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -1037,6 +1038,25 @@ export class TreeSitterExtractor {
         this.language === 'c' ||
         this.language === 'objc' ||
         (this.language === 'cpp' && (!this.tree.rootNode.hasError || this.cppBraceScopes !== null));
+
+      // Native extraction defers errored TS/TSX parses here too. Recover only
+      // the known type-only star-export grammar gap; unrelated parse errors
+      // remain in the reparsed tree and retain the normal diagnostics below.
+      if ((this.language === 'typescript' || this.language === 'tsx') && this.tree.rootNode.hasError) {
+        const normalized = blankTypeOnlyStarExportModifiers(this.source, this.tree.rootNode);
+        if (normalized !== this.source) {
+          const reparsed = parser.parse(normalized);
+          if (reparsed) {
+            this.tree.delete();
+            this.tree = reparsed;
+            // Comment-separated modifiers can bypass the fast preParse path.
+            // Their import nodes still keep the original re-export statement.
+            this.sourceAsWritten ??= this.source;
+            this.reExportsAsWritten = true;
+            this.source = normalized;
+          }
+        }
+      }
 
       // Create file node representing the source file
       const fileNode: Node = {

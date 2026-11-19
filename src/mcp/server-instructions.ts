@@ -25,7 +25,7 @@ reading files (cached intelligence: thousands of parse/trace decisions you
 don't pay to re-reason each run). It indexes 30+ languages
 (TypeScript/JavaScript, Python, Go, Rust, Java, C#, C/C++, PHP, Ruby, Swift,
 Kotlin, and more) — don't assume a language here isn't covered. Reads are
-sub-millisecond; the index lags writes by ~1s through the file watcher. Reach for it BEFORE *and* while
+sub-millisecond; background freshness follows the workspace's configured sync interval. Reach for it BEFORE *and* while
 writing or editing code — not just for questions: one call returns the
 verbatim source PLUS who calls it and what it affects, so you edit with the
 blast radius in view. More accurate context, in far fewer tokens and
@@ -72,7 +72,7 @@ calls; a grep/read exploration is dozens.
 ## Limitations
 
 - If a tool reports a project isn't indexed (no \`.codegraph/\`), stop calling codegraph tools for that project for the rest of the session and use your built-in tools there instead. Indexing is the user's decision — mention they can run \`codegraph init\` if it comes up, but don't run it yourself.
-- Index lags file writes by ~1 second.
+- Index freshness follows \`.codegraph/config.yaml\` background settings; explicit sync/index commands run immediately.
 - Cross-file resolution is best-effort name matching; ambiguous calls may return multiple candidates.
 - No live correctness validation — that's still the TypeScript compiler / test suite / linter's job. Codegraph supplements those with structural context they don't have.
 `;
@@ -96,8 +96,11 @@ files (30+ languages): one \`codegraph_explore\` call returns the verbatim, line
 of the relevant symbols PLUS the call paths between them and a blast-radius
 summary — replacing a grep + Read loop with one round-trip.
 
-This server started somewhere with no \`.codegraph/\` of its own, so there is no
-default project — but the tools are available and work **per project**:
+The default workspace is the nearest \`.codegraph/\` directory or directory
+symlink at or above the starting directory, stopping before HOME. The per-user
+\`~/.codegraph\` directory is skipped; if no project marker is found, the starting
+directory itself is selected. That workspace has no initialized
+index, so the tools are available **per project** until it is initialized:
 
 - To query a project that HAS a \`.codegraph/\` index (e.g. a service inside a
   monorepo, or a second repo), pass its path as \`projectPath\` to

@@ -5,14 +5,16 @@
  * (and user-facing TELEMETRY.md); the ingest endpoint that enforces it is
  * public at telemetry-worker/. This module honors four invariants:
  *
- * 1. Recording rechecks the small consent file, then increments in memory. Disk writes are
- *    a tiny synchronous append at process exit (works under `process.exit()`,
+ * 1. Recording rechecks the small consent file, then increments in memory.
+ *    An environment opt-in prepares its local identity once before recording.
+ *    Usage writes are a tiny synchronous append at process exit (works under `process.exit()`,
  *    where `beforeExit` never fires); network sends happen opportunistically
  *    (startup of long-running commands, daemon interval, bounded await at the
  *    end of install/init) and are fire-and-forget everywhere else.
  * 2. Zero stdout: stdio is the MCP protocol channel. Notices and debug output
  *    go to stderr only.
- * 3. Off is off: when disabled, nothing is recorded, nothing is sent, and no
+ * 3. Off by default: only an explicit opt-in enables collection. When disabled,
+ *    nothing is recorded, nothing is sent, and no
  *    socket is opened — there is no "opted out" ping. Turning telemetry off
  *    also deletes any buffered, unsent data.
  * 4. Fail silent: offline, endpoint down, disk full — every failure mode is
@@ -70,10 +72,12 @@ export function recordIndexEvent(
   result: { filesIndexed: number; durationMs: number },
 ): void {
   try {
+    const telemetry = getTelemetry();
+    if (!telemetry.isEnabled()) return;
     const languages = Object.entries(cg.getStats().filesByLanguage)
       .filter(([, count]) => count > 0)
       .map(([lang]) => lang);
-    getTelemetry().recordLifecycle('index', {
+    telemetry.recordLifecycle('index', {
       languages,
       file_count_bucket: bucketFileCount(result.filesIndexed),
       duration_bucket: bucketDuration(result.durationMs),
@@ -91,7 +95,7 @@ export interface ClientInfo {
 interface ConfigFile {
   enabled: boolean;
   machine_id: string | null;
-  consent_source: 'installer' | 'default-notice' | 'cli';
+  consent_source: 'installer' | 'default-notice' | 'cli' | 'environment';
   first_run_notice_shown?: boolean;
   updated_at: string;
 }
@@ -230,11 +234,15 @@ export class Telemetry {
 
   /**
    * Resolution order (first match wins) — keep in sync with TELEMETRY.md:
-   * DO_NOT_TRACK=1 > CODEGRAPH_TELEMETRY=0|1 > stored config > default on.
+   * DO_NOT_TRACK=1 > CODEGRAPH_TELEMETRY=0|1 > explicit stored choice > off.
+   * A legacy default-on notice is not consent, and an environment override
+   * must not silently opt future processes in after that variable is removed.
    */
   getStatus(): TelemetryStatus {
     const config = this.readConfig();
-    const machineId = config?.machine_id ?? null;
+    const explicitChoice = config?.consent_source === 'cli' || config?.consent_source === 'installer';
+    const machineId = explicitChoice || config?.consent_source === 'environment'
+      ? config?.machine_id ?? null : null;
     const dnt = this.env.DO_NOT_TRACK;
     if (dnt !== undefined && dnt !== '' && dnt !== '0' && dnt.toLowerCase() !== 'false') {
       this.clearPending();
@@ -242,15 +250,17 @@ export class Telemetry {
     }
     const forced = this.env.CODEGRAPH_TELEMETRY;
     if (forced !== undefined && forced !== '') {
-      const on = forced !== '0' && forced.toLowerCase() !== 'false';
+      const on = forced === '1' || forced.toLowerCase() === 'true';
       if (!on) this.clearPending();
       return { enabled: on, decidedBy: 'CODEGRAPH_TELEMETRY', machineId, configPath: this.configPath };
     }
     if (config) {
-      if (!config.enabled) this.clearPending();
-      return { enabled: config.enabled, decidedBy: 'config', machineId, configPath: this.configPath };
+      const on = config.enabled && explicitChoice;
+      if (!on) this.clearPending();
+      return { enabled: on, decidedBy: 'config', machineId, configPath: this.configPath };
     }
-    return { enabled: true, decidedBy: 'default', machineId, configPath: this.configPath };
+    this.clearPending();
+    return { enabled: false, decidedBy: 'default', machineId, configPath: this.configPath };
   }
 
   isEnabled(): boolean {
@@ -264,36 +274,31 @@ export class Telemetry {
    */
   setEnabled(enabled: boolean, source: 'installer' | 'cli'): void {
     const existing = this.readConfig();
+    const hadConsent = existing?.enabled &&
+      (existing.consent_source === 'cli' || existing.consent_source === 'installer');
+    // An old default-on queue must never become sendable merely because the
+    // user opts in now. Explicit consent applies to future collection only.
+    if (!enabled || !hadConsent) this.discardQueuedData();
     this.writeConfig({
       enabled,
-      machine_id: enabled ? (existing?.enabled && existing.machine_id ? existing.machine_id : randomUUID()) : null,
+      machine_id: enabled ? (hadConsent && existing.machine_id ? existing.machine_id : randomUUID()) : null,
       consent_source: source,
       first_run_notice_shown: true,
       updated_at: this.now().toISOString(),
     });
-    if (!enabled) {
-      this.clearPending();
-      try {
-        // Claimed data must not reappear on a later opt-in/crash recovery.
-        for (const name of fs.readdirSync(this.dir)) {
-          if (name === 'telemetry-queue.jsonl' || /^telemetry-queue\.sending\.\d+\.jsonl$/.test(name)) {
-            try { fs.rmSync(path.join(this.dir, name), { force: true }); } catch { /* fail silent */ }
-          }
-        }
-      } catch { /* fail silent */ }
-    }
   }
 
-  /** True once any consent decision (or the first-run notice) is on disk. */
+  /** True once the user made an explicit stored consent decision. */
   hasStoredChoice(): boolean {
-    return this.readConfig() !== null;
+    const source = this.readConfig()?.consent_source;
+    return source === 'cli' || source === 'installer';
   }
 
   // -------------------------------------------------------------- recording
 
-  /** Recheck shared consent, then increment in memory; no network or writes. */
+  /** Recheck explicit consent, then increment in memory; never contacts the network. */
   recordUsage(kind: UsageKind, name: string, ok: boolean, client?: ClientInfo): void {
-    if (!this.isEnabled()) return;
+    if (!this.prepareConsentState()) return;
     const fresh: CountLine = { v: SCHEMA_VERSION, d: this.utcDay(), k: kind, n: name.slice(0, 64), c: 1, e: ok ? 0 : 1 };
     const cn = client?.name?.slice(0, 64);
     const cv = client?.version?.slice(0, 32);
@@ -312,7 +317,7 @@ export class Telemetry {
 
   /** install / index / uninstall — buffered like everything else. */
   recordLifecycle(event: LifecycleEvent, props: Record<string, unknown>): void {
-    if (!this.isEnabled()) return;
+    if (!this.prepareConsentState()) return;
     this.events.push({ v: SCHEMA_VERSION, ev: event, ts: this.now().toISOString(), props });
     this.ensureExitHook();
   }
@@ -333,7 +338,7 @@ export class Telemetry {
    * next process. Awaited only where latency is invisible (install/init).
    */
   async flushNow(timeoutMs: number = DEFAULT_FLUSH_TIMEOUT_MS): Promise<void> {
-    if (!this.isEnabled()) return;
+    if (!this.prepareConsentState()) return;
     try {
       this.persistSync();
       this.recoverStaleClaims();
@@ -353,12 +358,9 @@ export class Telemetry {
       }
       let failed: BufferLine[] = [];
       if (sendable.length > 0) {
-        // Consent gate: the one-time notice precedes the FIRST bytes that
-        // ever leave the machine (and mints the machine id). Recording only
-        // buffers locally, so it stays silent — this lets the installer show
-        // its explicit consent toggle before any notice can fire, instead of
-        // the preAction usage count pre-empting it. An explicit installer/CLI
-        // choice sets first_run_notice_shown and suppresses this permanently.
+        // Recheck explicit consent before any bytes leave the machine. An
+        // environment-only opt-in gets its notice on first send; an explicit
+        // installer/CLI choice already has its acknowledgement on disk.
         if (!this.canUseIdentity(identity)) {
           try { fs.rmSync(claimPath, { force: true }); } catch { /* fail silent */ }
           return;
@@ -406,6 +408,42 @@ export class Telemetry {
     this.events = [];
   }
 
+  private discardQueuedData(): void {
+    this.clearPending();
+    try {
+      // Claimed data must not reappear on a later opt-in/crash recovery.
+      for (const name of fs.readdirSync(this.dir)) {
+        if (name === 'telemetry-queue.jsonl' || /^telemetry-queue\.sending\.\d+\.jsonl$/.test(name)) {
+          try { fs.rmSync(path.join(this.dir, name), { force: true }); } catch { /* fail silent */ }
+        }
+      }
+    } catch { /* fail silent */ }
+  }
+
+  /**
+   * Start an environment-only consent period before collecting anything. A
+   * legacy default-on queue (including crash claims) predates this consent and
+   * must not be uploaded under a newly minted identity. Persisting that
+   * identity now also distinguishes fresh opted-in queues across short-lived
+   * processes, even when their same-day counts are not sendable yet.
+   */
+  private prepareConsentState(): boolean {
+    if (!this.isEnabled()) return false;
+    const config = this.readConfig();
+    const explicitChoice = config?.consent_source === 'cli' || config?.consent_source === 'installer';
+    if ((explicitChoice || config?.consent_source === 'environment') && config?.machine_id) return true;
+    this.discardQueuedData();
+    this.writeConfig({
+      enabled: explicitChoice ? config!.enabled : false,
+      machine_id: randomUUID(),
+      consent_source: explicitChoice ? config!.consent_source : 'environment',
+      first_run_notice_shown: explicitChoice ? config!.first_run_notice_shown : false,
+      updated_at: this.now().toISOString(),
+    });
+    // Fail closed if the consent state could not be persisted.
+    return this.isEnabled() && this.getStatus().machineId !== null;
+  }
+
   private canUseIdentity(identity: string | null): boolean {
     const status = this.getStatus();
     return status.enabled && status.machineId === identity;
@@ -443,23 +481,18 @@ export class Telemetry {
   }
 
   /**
-   * Default-on consent is gated by a one-time stderr notice (interactive
-   * installs record their choice explicitly and never reach this).
+   * Explain an explicit environment opt-in once, before the first send.
+   * Interactive installs and the CLI record their choice explicitly.
    */
   private firstRunNotice(): void {
     if (!this.isEnabled()) return;
     const config = this.readConfig();
-    if (config?.first_run_notice_shown && config.machine_id) return;
+    if (!config?.machine_id || config.first_run_notice_shown) return;
     this.writeConfig({
-      enabled: config?.enabled ?? true,
-      machine_id: config?.machine_id ?? randomUUID(),
-      consent_source: config?.consent_source ?? 'default-notice',
+      ...config,
       first_run_notice_shown: true,
       updated_at: this.now().toISOString(),
     });
-    // An explicit env-on override can mint a new identity while the stored
-    // choice stays off for every other process. It does not need a new notice.
-    if (config?.first_run_notice_shown) return;
     this.writeStderr(
       `codegraph collects anonymous usage stats (no code, paths, or names) — ` +
       `"codegraph telemetry off" or CODEGRAPH_TELEMETRY=0 disables. Details: ${TELEMETRY_DOCS}\n`,

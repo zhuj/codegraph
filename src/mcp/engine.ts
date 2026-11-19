@@ -11,7 +11,6 @@
  */
 
 import * as os from 'os';
-import * as path from 'path';
 import type CodeGraph from '../index';
 import { resolveServerRoot } from '../directory';
 import { ToolHandler } from './tools';
@@ -22,6 +21,7 @@ import { assertNoRebuild, releaseWriterLock, tryAcquireWriterLock, writerLockHel
 import { QueryPool, resolvePoolSize } from './query-pool';
 import { endFreshnessMeasurements } from './index-freshness';
 import { acquireProject, ProjectLease } from './project-lifecycle';
+import { loadBackgroundConfig } from '../workspace-config';
 
 // Lazy-load the heavy CodeGraph chain (sqlite + query/graph/context layers) OFF
 // the MCP startup path. It's only needed once a tool actually opens a project —
@@ -31,9 +31,6 @@ import { acquireProject, ProjectLease } from './project-lifecycle';
 // agents flounder. require() is sync + cached on the CommonJS build.
 const loadCodeGraph = (): typeof import('../index').default =>
   (require('../index') as typeof import('../index')).default;
-
-/** How often the per-tool-call retry may re-run the sub-project down-scan. */
-const RETRY_SUBSCAN_TTL_MS = 5_000;
 
 /**
  * Why the default project failed to open, when a tool call should say so
@@ -82,15 +79,11 @@ export interface MCPEngineOptions {
 export class MCPEngine {
   private cg: CodeGraph | null = null;
   private toolHandler: ToolHandler;
-  // Project root we resolved to. Null until `ensureInitialized` succeeds
-  // (or null forever if no .codegraph/ ever turned up — that's a valid
-  // state for the engine, since cross-project queries still work).
+  // Selected workspace, including cwd when no ancestor marker exists.
+  // It may be uninitialized; explicit cross-project queries still work.
   private projectPath: string | null = null;
   // Set on first `ensureInitialized` so subsequent sessions don't redo work.
   private initPromise: Promise<void> | null = null;
-  // Throttle for the retry path's sub-project down-scan (#1606) — the scan is
-  // bounded but shouldn't run on every tool call in the no-default state.
-  private lastRetrySubScanAt = 0;
   // The default-root refusal last written to stderr, so the retry on every
   // tool call doesn't repeat it.
   private loggedRootRefusal: string | null = null;
@@ -238,23 +231,15 @@ export class MCPEngine {
   retryInitializeSync(searchFrom: string): void {
     if (this.closed) return;
     if (this.toolHandler.hasDefaultCodeGraph()) return;
-    this.toolHandler.setDefaultProjectHint(searchFrom);
-    // Same resolution `doInitialize` used: up-walk, then the bounded workspace
-    // down-scan (#1606) — this retry is exactly the path that picks up a
-    // project (root or child) `codegraph init`'d after the server started. The
-    // down-scan is throttled so the persistent no-default state doesn't pay a
-    // directory walk on every tool call; the up-walk always runs.
-    const scanDue = Date.now() - this.lastRetrySubScanAt >= RETRY_SUBSCAN_TTL_MS;
-    const res = resolveServerRoot(searchFrom, { subprojectScan: scanDue });
-    if (scanDue) {
-      this.lastRetrySubScanAt = Date.now();
-      if (!res.root) this.toolHandler.setKnownSubprojects(res.candidates, searchFrom);
-    }
-    // An up-walk alone can't clear a refusal the throttled down-scan found.
-    if (scanDue || res.refusal) this.noteRootRefusal(res.refusal);
+    // Recheck the selected workspace on every call so `codegraph init` can
+    // enable it during this session. An indexed child never changes the default.
+    const res = resolveServerRoot(searchFrom);
+    this.projectPath = res.workspaceRoot;
+    this.toolHandler.setDefaultProjectHint(res.workspaceRoot);
+    this.toolHandler.setKnownSubprojects([], res.workspaceRoot);
+    this.noteRootRefusal(res.refusal);
     const resolvedRoot = res.root;
     if (!resolvedRoot) return;
-    if (res.viaSubScan) this.logSubprojectAdoption(searchFrom, resolvedRoot);
     try {
       // Close any previously failed instance to avoid leaking resources.
       if (this.cg) {
@@ -368,38 +353,25 @@ export class MCPEngine {
   }
 
   private async doInitialize(searchFrom: string): Promise<void> {
-    this.toolHandler.setDefaultProjectHint(searchFrom);
-
-    // Up-walk first; when nothing is indexed at or above searchFrom, a bounded
-    // down-scan may adopt a SINGLE indexed sub-project as the default (#1606 —
-    // the workspace-container shape where only children are indexed). Zero or
-    // several candidates → no default project, but SAY so (#1607): the silent
-    // variant of this state read as "CodeGraph is broken" and was diagnosable
-    // only by knowing to look for a missing ~/.codegraph/daemons/ entry.
+    // Keep the selected current/ancestor workspace even when it has no index.
+    // Other indexed projects remain available only through explicit projectPath.
     const res = resolveServerRoot(searchFrom);
+    this.projectPath = res.workspaceRoot;
+    this.toolHandler.setDefaultProjectHint(res.workspaceRoot);
+    this.toolHandler.setKnownSubprojects([], res.workspaceRoot);
     const resolvedRoot = res.root;
     this.noteRootRefusal(res.refusal);
     if (!resolvedRoot) {
       // Sessions may still discover a project later via roots/list, and the
-      // per-call retry re-resolves — this state is recoverable, hence stderr
-      // (not a failure) + candidates surfaced through the tool-call error.
-      this.projectPath = searchFrom;
-      this.toolHandler.setKnownSubprojects(res.candidates, searchFrom);
+      // per-call retry picks up initialization of the selected workspace.
       if (!res.refusal) {
         process.stderr.write(
-          `[CodeGraph MCP] No .codegraph/ at or above ${searchFrom}: no default project, live sync disabled until an indexed project is accessed via projectPath.\n`
-        );
-      }
-      if (res.candidates.length > 0) {
-        const rels = res.candidates.map((c) => path.relative(searchFrom, c) || '.');
-        process.stderr.write(
-          `[CodeGraph MCP] Indexed sub-projects found: ${rels.join(', ')}. Pass \`projectPath\` per call, or launch with --path.\n`
+          `[CodeGraph MCP] No CodeGraph index in the selected workspace ${res.workspaceRoot}: no default project, live sync disabled until this workspace is initialized or an indexed project is accessed via projectPath.\n`
         );
       }
       this.maybeStartPool(null);
       return;
     }
-    if (res.viaSubScan) this.logSubprojectAdoption(searchFrom, resolvedRoot);
 
     this.projectPath = resolvedRoot;
     try {
@@ -434,14 +406,6 @@ export class MCPEngine {
     );
   }
 
-  /** One stderr line when the default project came from the down-scan (#1606). */
-  private logSubprojectAdoption(searchFrom: string, root: string): void {
-    const rel = path.relative(searchFrom, root) || root;
-    process.stderr.write(
-      `[CodeGraph MCP] No .codegraph/ at ${searchFrom}; adopted the single indexed sub-project ${rel} as the default project.\n`
-    );
-  }
-
   /**
    * Start file watching on the active CodeGraph instance. Idempotent — the
    * watcher is per-engine, not per-session, which is why the daemon path
@@ -473,6 +437,8 @@ export class MCPEngine {
   private catchUpSync(afterReopen = false): void {
     const cg = this.cg;
     if (!cg || this.opts.readOnly) return;
+    const background = loadBackgroundConfig(cg.getProjectRoot());
+    if (!background.enabled || background.intervalSeconds === 0) return;
     // The lease's gate is the startup reconcile and stays settled once caught
     // up; a database reopened after a rebuild (#1902) needs a sync of its own.
     if (this.defaultLease && !afterReopen) {

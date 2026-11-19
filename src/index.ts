@@ -5,6 +5,7 @@
  * knowledge graph from any codebase.
  */
 
+import { withProgressActivity, type ProgressActivity } from './progress-activity';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
@@ -56,7 +57,7 @@ import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import ignore from 'ignore';
-import { loadDeprioritizePatterns } from './project-config';
+import { loadDeprioritizePatterns, loadWorkspaceConfig, ensureWorkspaceConfig } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
@@ -74,6 +75,7 @@ export {
   getCodeGraphDir,
   isInitialized,
   findNearestCodeGraphRoot,
+  resolveWorkspaceRoot,
   CODEGRAPH_DIR,
 } from './directory';
 export type { IndexProgress, IndexResult, SyncResult } from './extraction';
@@ -124,6 +126,9 @@ export interface OpenOptions {
  * Options for indexing
  */
 export interface IndexOptions {
+  /** Optional console activity channel; never affects indexing or graph results. */
+  activity?: ProgressActivity;
+
   /** Progress callback */
   onProgress?: (progress: IndexProgress) => void;
 
@@ -420,6 +425,8 @@ export class CodeGraph {
       throw new Error(`CodeGraph already initialized in ${resolvedRoot}`);
     }
 
+    // Validate a user-supplied scope before creating the index database.
+    loadWorkspaceConfig(resolvedRoot);
     // Create directory structure
     createDirectory(resolvedRoot);
 
@@ -449,6 +456,8 @@ export class CodeGraph {
       throw new Error(`CodeGraph already initialized in ${resolvedRoot}`);
     }
 
+    // Validate a user-supplied scope before creating the index database.
+    loadWorkspaceConfig(resolvedRoot);
     // Create directory structure
     createDirectory(resolvedRoot);
 
@@ -537,6 +546,11 @@ export class CodeGraph {
     if (!isInitialized(resolvedRoot)) {
       throw new Error(`CodeGraph not initialized in ${resolvedRoot}. Run init() first.`);
     }
+
+    // CLI `index` rebuilds through this path. A malformed YAML allowlist must
+    // fail before the old database is removed, preserving the last good index.
+    ensureWorkspaceConfig(resolvedRoot);
+    loadWorkspaceConfig(resolvedRoot);
 
     const dbPath = getDatabasePath(resolvedRoot);
     try {
@@ -653,7 +667,7 @@ export class CodeGraph {
    * Uses a mutex to prevent concurrent indexing operations.
    */
   async indexAll(options: IndexOptions = {}): Promise<IndexResult> {
-    return this.indexMutex.withLock(async () => {
+    return this.indexMutex.withLock(() => withProgressActivity(options.activity, async () => {
       const startedAt = Date.now();
       try {
         this.fileLock.acquire();
@@ -966,7 +980,7 @@ export class CodeGraph {
         }
         this.fileLock.release();
       }
-    });
+    }));
   }
 
   /**
@@ -1149,7 +1163,7 @@ export class CodeGraph {
       reopenReferencesThroughRetargetedModules,
       trustedManifestList,
     } = engine();
-    return this.indexMutex.withLock(async () => {
+    return this.indexMutex.withLock(() => withProgressActivity(options.activity, async () => {
       const startedAt = Date.now();
       try {
         this.fileLock.acquire();
@@ -1914,7 +1928,7 @@ export class CodeGraph {
         }
         this.fileLock.release();
       }
-    });
+    }));
   }
 
   /**
@@ -2115,6 +2129,11 @@ export class CodeGraph {
   /** The reason live watching degraded, or null if it is healthy (#876). */
   getWatcherDegradedReason(): string | null {
     return this.watcher?.getDegradedReason() ?? null;
+  }
+
+  /** Whether a workspace config edit paused background sync, rather than an OS failure. */
+  isWatcherPausedByConfig(): boolean {
+    return this.watcher?.isPausedByConfig() ?? false;
   }
 
   /** Re-arm a lock-degraded watcher; its stale state persists until a full sync. */

@@ -1,0 +1,95 @@
+name: Fix branch validation
+
+on:
+  push:
+    branches: [my/fixes-1.6.3]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fixes-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CODEGRAPH_TELEMETRY: '0'
+      DO_NOT_TRACK: '1'
+      CODEGRAPH_NO_UPDATE_CHECK: '1'
+      CODEGRAPH_NO_DAEMON: '1'
+      CODEGRAPH_PARSE_WORKERS: '2'
+      CODEGRAPH_RESOLVE_WORKERS: '2'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build
+      - name: Ported fixes and upstream compatibility regressions
+        shell: bash
+        run: >-
+          npx --no-install vitest run --project engine --maxWorkers=2
+          __tests__/progress-activity.test.ts
+          __tests__/shimmer-progress.test.ts
+          __tests__/glyphs.test.ts
+          __tests__/worker-teardown.test.ts
+          __tests__/synthesis-optimizations.test.ts
+          __tests__/synthesis-progress.test.ts
+          __tests__/synthesis-tail-scaling.test.ts
+          __tests__/closure-collection-synthesizer.test.ts
+          __tests__/fabric-view.test.ts
+          __tests__/migrations-synthesis-json.test.ts
+          __tests__/sync-rebuild-convergence.test.ts
+          __tests__/parse-pool.test.ts
+          __tests__/cli-no-color.test.ts
+          __tests__/cli-sync.test.ts
+          __tests__/workspace-config.test.ts
+          __tests__/workspace-discovery.test.ts
+          __tests__/default-offline.test.ts
+          __tests__/background-sync.test.ts
+          __tests__/background-hook-sync.test.ts
+          __tests__/telemetry.test.ts
+          __tests__/update-check.test.ts
+          __tests__/npm-shim.test.ts
+          __tests__/installer-targets.test.ts
+          __tests__/typescript-type-star-exports.test.ts
+          __tests__/ts-export-type-star.test.ts
+          __tests__/git-hooks.test.ts
+          __tests__/frontload-hook.test.ts
+          __tests__/mcp-projectpath-lifecycle.test.ts
+          __tests__/mcp-roots.test.ts
+          __tests__/mcp-subproject-adoption.test.ts
+          __tests__/schemaless-db-not-initialized.test.ts
+          __tests__/sync.test.ts
+          __tests__/watcher.test.ts
+          __tests__/watcher-replaced-db.test.ts
+          __tests__/wsl-shared-index.test.ts
+          __tests__/security.test.ts
+          __tests__/lazy-engine.test.ts
+          __tests__/local-only-gitignore.test.ts
+          __tests__/mcp-projectpath-file.test.ts
+          __tests__/mcp-nested-repo-projectpath.test.ts
+          __tests__/sync-module-config-change.test.ts
+          __tests__/sync-memo-lifetime.test.ts
+          __tests__/jsx-child-disambiguation.test.ts
+          __tests__/jsx-render-work.test.ts
+          __tests__/jest-manual-mocks.test.ts
+          __tests__/resolver-project-scans.test.ts
+          __tests__/resolver-pool-pipeline.test.ts
+          __tests__/resolver-pool-sizing.test.ts
+          __tests__/cpp-template-instantiations.test.ts
+          __tests__/go-func-field-dispatch.test.ts
+          __tests__/const-alias-flow.test.ts
+          __tests__/liveness-watchdog-projects.test.ts

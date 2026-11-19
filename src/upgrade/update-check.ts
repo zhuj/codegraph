@@ -16,7 +16,8 @@
  *     respond-fast handshake contract holds.
  *   - Fail silent: offline / rate-limited / disk-full all degrade to "no
  *     notice", never an error, never a retry loop.
- *   - Off is off: `CODEGRAPH_NO_UPDATE_CHECK` (dedicated) or `DO_NOT_TRACK`
+ *   - Off by default: only `CODEGRAPH_UPDATE_CHECK=1` (or `true`) opts in.
+ *     `CODEGRAPH_NO_UPDATE_CHECK` (dedicated) or `DO_NOT_TRACK`
  *     (broad don't-phone-home convention — set by e.g. the Pro container's
  *     data plane) suppresses the network call AND the notice entirely.
  *
@@ -87,7 +88,9 @@ function envTruthy(raw: string | undefined): boolean {
  * notice. `DO_NOT_TRACK` uses the same truthiness the telemetry opt-out does.
  */
 export function updateCheckDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return envTruthy(env.CODEGRAPH_NO_UPDATE_CHECK) || envTruthy(env.DO_NOT_TRACK);
+  const optIn = env.CODEGRAPH_UPDATE_CHECK;
+  return !(optIn === '1' || optIn?.toLowerCase() === 'true') ||
+    envTruthy(env.CODEGRAPH_NO_UPDATE_CHECK) || envTruthy(env.DO_NOT_TRACK);
 }
 
 export function updateCheckCachePath(dir: string): string {

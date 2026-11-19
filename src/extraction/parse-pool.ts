@@ -27,6 +27,7 @@
  * the default is capped and the env var lets constrained machines dial it down.
  */
 
+import { workerActivity, invalidateWorkerActivity, type WorkerActivity } from '../progress-activity';
 import { Worker } from 'worker_threads';
 import type { Language, ExtractionResult } from '../types';
 
@@ -238,6 +239,8 @@ export interface ParseWorkerPoolOptions {
 
 export class ParseWorkerPool {
   private idle: ParsePoolWorker[] = [];
+  private activitySlots = new Map<ParsePoolWorker, number>();
+  private activityHandles = new Map<ParsePoolWorker, WorkerActivity>();
   private queue: ParseJob[] = [];
   private inflight = new Map<ParsePoolWorker, ParseJob>();
   private workers = new Set<ParsePoolWorker>();
@@ -349,6 +352,9 @@ export class ParseWorkerPool {
       this.totalCrashes++; // counts toward the circuit breaker
       return;
     }
+    let slot = 1;
+    while ([...this.activitySlots.values()].includes(slot)) slot++;
+    this.activitySlots.set(w, slot);
     this.workers.add(w);
     this.pending.add(w);
     this.parseCounts.set(w, 0);
@@ -461,6 +467,9 @@ export class ParseWorkerPool {
   }
 
   private removeWorker(w: ParsePoolWorker): void {
+    invalidateWorkerActivity(this.activityHandles.get(w));
+    this.activityHandles.delete(w);
+    this.activitySlots.delete(w);
     this.workers.delete(w);
     this.pending.delete(w);
     this.parseCounts.delete(w);
@@ -476,7 +485,10 @@ export class ParseWorkerPool {
     job.budgetMs = timeoutMs;
     job.timer = setTimeout(() => this.onTimeout(w, job, timeoutMs), timeoutMs);
     job.timer.unref?.();
+    const activity = workerActivity(this.activitySlots.get(w) ?? 1);
+    if (activity) this.activityHandles.set(w, activity);
     w.postMessage({
+      activity,
       type: 'parse',
       id: job.id,
       filePath: job.task.filePath,
@@ -571,6 +583,9 @@ export class ParseWorkerPool {
     if (this.destroyed) return;
     this.destroyed = true;
     const ws = [...this.workers];
+    for (const activity of this.activityHandles.values()) invalidateWorkerActivity(activity);
+    this.activityHandles.clear();
+    this.activitySlots.clear();
     this.workers.clear();
     this.pending.clear();
     this.parseCounts.clear();

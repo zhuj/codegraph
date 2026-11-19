@@ -15,9 +15,11 @@
 // and some corporate proxies — don't reliably mirror the per-platform
 // optionalDependencies. npm treats an unfetchable optional dep as success and
 // silently skips it, so the bundle goes missing and every command fails. When
-// the installed bundle can't be resolved, this shim falls back to downloading
+// the installed bundle can't be resolved, this shim can opt in to downloading
 // the matching bundle straight from GitHub Releases — the very archive
-// install.sh uses — into a cache dir, then runs that. Knobs:
+// install.sh uses — into a cache dir, then runs that. Downloads are OFF by
+// default; normal commands never bootstrap themselves over the network. Knobs:
+//   CODEGRAPH_ALLOW_DOWNLOAD=1  explicitly enable the network fallback
 //   CODEGRAPH_NO_DOWNLOAD=1     disable the network fallback (print guidance)
 //   CODEGRAPH_INSTALL_DIR=DIR   cache location (default: ~/.codegraph)
 //   CODEGRAPH_DOWNLOAD_BASE=URL release-download base (for mirrors/air-gapped)
@@ -42,8 +44,8 @@ main().catch(function (e) {
 });
 
 async function main() {
-  // Happy path: the npm-installed optional dependency. Fall back to a download
-  // when the registry didn't deliver it.
+  // Happy path: the npm-installed optional dependency. A cached bundle also
+  // works offline; downloading a missing bundle requires an explicit opt-in.
   var resolved = resolveInstalledBundle() || (await selfHealBundle());
   // Thread the MCP host's pid (our parent) down to the bundled server so its
   // orphan watchdog can poll the host directly. Without this, the server can
@@ -121,6 +123,10 @@ async function selfHealBundle() {
 
   if (process.env.CODEGRAPH_NO_DOWNLOAD) {
     fail('the network fallback is disabled (CODEGRAPH_NO_DOWNLOAD is set).');
+  }
+  var allowDownload = process.env.CODEGRAPH_ALLOW_DOWNLOAD;
+  if (allowDownload !== '1' && (!allowDownload || allowDownload.toLowerCase() !== 'true')) {
+    fail('automatic bundle downloads are disabled by default. Set CODEGRAPH_ALLOW_DOWNLOAD=1 to opt in for this invocation.');
   }
 
   var asset = 'codegraph-' + target + (isWindows ? '.zip' : '.tar.gz');

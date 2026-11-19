@@ -21,6 +21,8 @@
  * need receiver-type matching, deferred to Phase 3). All synthesized edges are
  * tagged `provenance:'heuristic'`. See docs/design/callback-edge-synthesis.md.
  */
+import { SourceSlices } from './source-slices';
+import { reportCurrentDirectory } from '../progress-activity';
 import type { Edge, Language, Node, NodeKind } from '../types';
 import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
@@ -137,17 +139,13 @@ function nuxtComponentName(filePath: string): string | null {
   return out.join('');
 }
 
-// Passes call sliceLines once per node, so splitting the whole file each
-// time is quadratic in a file's node count. Keep the last file's lines.
-let sliceLinesSource: string | null = null;
-let sliceLinesSplit: string[] = [];
-function sliceLines(content: string, startLine?: number, endLine?: number): string | null {
-  if (!startLine || !endLine) return null;
-  if (content !== sliceLinesSource) {
-    sliceLinesSource = content;
-    sliceLinesSplit = content.split('\n');
-  }
-  return sliceLinesSplit.slice(startLine - 1, endLine).join('\n');
+// Per-context, bounded offsets avoid splitting the whole file per method while
+// retaining useful slices across interleaved files. Drop them after synthesis.
+const sourceSlices = new WeakMap<ResolutionContext, SourceSlices>();
+function sliceLines(ctx: ResolutionContext, file: string, content: string, startLine?: number, endLine?: number): string | null {
+  let slices = sourceSlices.get(ctx);
+  if (!slices) { slices = new SourceSlices(); sourceSlices.set(ctx, slices); }
+  return slices.slice(file, content, startLine, endLine);
 }
 
 // `src.slice(0, idx).split('\n').length` per match is quadratic in a file's
@@ -163,10 +161,9 @@ function lineOf(src: string, idx: number): number {
   return lineOfIndex(idx);
 }
 
-/** Forget the last file sliceLines and lineOf keep, once a synthesis run is over. */
-function releaseLineCaches(): void {
-  sliceLinesSource = null;
-  sliceLinesSplit = [];
+/** Forget retained source and line offsets once a synthesis run is over. */
+function releaseLineCaches(ctx: ResolutionContext): void {
+  sourceSlices.delete(ctx);
   lineOfSource = null;
   lineOfIndex = () => 1;
 }
@@ -190,15 +187,15 @@ function dispatcherField(src: string): string | null {
  * is gigabytes on a symbol-dense project) just to iterate it once is what OOM'd
  * #610. Iterating keeps memory O(1) in the node count.
  */
-function* methodAndFunctionNodes(queries: QueryBuilder): IterableIterator<Node> {
-  yield* queries.iterateNodesByKind('method');
-  yield* queries.iterateNodesByKind('function');
+function* methodAndFunctionNodes(queries: QueryBuilder, languages?: string[]): IterableIterator<Node> {
+  yield* languages ? queries.iterateNodesByKindIn('method', languages) : queries.iterateNodesByKind('method');
+  yield* languages ? queries.iterateNodesByKindIn('function', languages) : queries.iterateNodesByKind('function');
 }
 
 /** Phase 1: field-backed observer channels (registrar/dispatcher share a store). */
 async function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   const registrars: Array<{ node: Node; field: string }> = [];
-  const dispatchers: Array<{ node: Node; field: string }> = [];
+  const dispatchers = new Map<string, Array<{ node: Node; field: string }>>();
 
   let scanned = 0;
   for (const m of methodAndFunctionNodes(queries)) {
@@ -207,18 +204,25 @@ async function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext, 
     const isDisp = DISPATCHER_NAME.test(m.name);
     if (!isReg && !isDisp) continue;
     const content = ctx.readFile(m.filePath);
-    const src = content && sliceLines(content, m.startLine, m.endLine);
+    const src = content && sliceLines(ctx, m.filePath, content, m.startLine, m.endLine);
     if (!src) continue;
     if (isReg) { const f = registrarField(src); if (f) registrars.push({ node: m, field: f }); }
-    if (isDisp) { const f = dispatcherField(src); if (f) dispatchers.push({ node: m, field: f }); }
+    if (isDisp) {
+      const f = dispatcherField(src);
+      if (f) {
+        const key = `${m.filePath}\0${f}`;
+        const group = dispatchers.get(key) ?? [];
+        group.push({ node: m, field: f });
+        dispatchers.set(key, group);
+      }
+    }
   }
 
   const edges: Edge[] = [];
   const seen = new Set<string>();
   for (const reg of registrars) {
-    const chDispatchers = dispatchers.filter(
-      (d) => d.node.filePath === reg.node.filePath && d.field === reg.field
-    );
+    // Same encounter order as filtering the old array, without O(R × D) work.
+    const chDispatchers = dispatchers.get(`${reg.node.filePath}\0${reg.field}`) ?? [];
     if (chDispatchers.length === 0) continue;
     const argRe = new RegExp(`${escapeRegExp(reg.node.name)}\\s*\\(\\s*(this\\.\\w+|\\w+)\\s*(?=[,)])`);
     let added = 0;
@@ -227,7 +231,8 @@ async function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext, 
       if (!e.line) continue;
       const caller = queries.getNodeById(e.source);
       if (!caller) continue;
-      const line = ctx.readFile(caller.filePath)?.split('\n')[e.line - 1];
+      const callerSource = ctx.readFile(caller.filePath);
+      const line = callerSource && sliceLines(ctx, caller.filePath, callerSource, e.line, e.line);
       const am = line?.match(argRe);
       if (!am) continue;
       // Reuse the resolved value at this registration site: it retains the
@@ -294,11 +299,11 @@ async function closureCollectionEdges(queries: QueryBuilder, ctx: ResolutionCont
   // watchdog on its own (#1091, #1235).
   let scanned = 0;
   let matchTick = 0;
-  for (const m of methodAndFunctionNodes(queries)) {
+  for (const m of methodAndFunctionNodes(queries, [...CC_LANGUAGES])) {
     if ((++scanned & 127) === 0) await onYield();
     if (!CC_LANGUAGES.has(m.language)) continue;
     const content = ctx.readFile(m.filePath);
-    const src = content && sliceLines(content, m.startLine, m.endLine);
+    const src = content && sliceLines(ctx, m.filePath, content, m.startLine, m.endLine);
     if (!src) continue;
     const hasForEach = src.includes('.forEach');
     const hasAppend = src.includes('.append(') || src.includes('.add(') || src.includes('.push(') || src.includes('.insert(');
@@ -457,7 +462,7 @@ async function reactRenderEdges(queries: QueryBuilder, ctx: ResolutionContext, o
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
       if (m.id === render.id) continue;
       const content = ctx.readFile(m.filePath);
-      const src = content && sliceLines(content, m.startLine, m.endLine);
+      const src = content && sliceLines(ctx, m.filePath, content, m.startLine, m.endLine);
       if (!src || !SETSTATE_RE.test(src)) continue;
       const key = `${m.id}>${render.id}`;
       if (seen.has(key)) continue;
@@ -498,7 +503,7 @@ async function flutterBuildEdges(queries: QueryBuilder, ctx: ResolutionContext, 
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
       if (m.id === build.id) continue;
       const content = ctx.readFile(m.filePath);
-      const src = content && sliceLines(content, m.startLine, m.endLine);
+      const src = content && sliceLines(ctx, m.filePath, content, m.startLine, m.endLine);
       if (!src || !FLUTTER_SETSTATE_RE.test(src)) continue;
       const key = `${m.id}>${build.id}`;
       if (seen.has(key)) continue;
@@ -572,7 +577,7 @@ async function arkuiStateBuildEdges(queries: QueryBuilder, ctx: ResolutionContex
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
       if (m.kind !== 'method' || m.id === build.id) continue;
       const content = ctx.readFile(m.filePath);
-      const src = content && sliceLines(content, m.startLine, m.endLine);
+      const src = content && sliceLines(ctx, m.filePath, content, m.startLine, m.endLine);
       if (!src || !mutationRe.test(stripCommentsForRegex(src, 'typescript'))) continue;
       const key = `${m.id}>${build.id}`;
       if (seen.has(key)) continue;
@@ -3602,7 +3607,7 @@ async function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionCon
   for (const n of queries.iterateNodesByKindIn('method', ['go'])) {
     if ((++scanned255 & 63) === 0) await onYield();
     const content = ctx.readFile(n.filePath);
-    const src = content && sliceLines(content, n.startLine, n.endLine);
+    const src = content && sliceLines(ctx, n.filePath, content, n.startLine, n.endLine);
     if (src && GIN_DISPATCH_RE.test(src)) dispatchers.push(n);
   }
   if (dispatchers.length === 0) return [];                              // not a gin repo — bail
@@ -3772,7 +3777,7 @@ async function reduxThunkEdges(queries: QueryBuilder, ctx: ResolutionContext, on
     // avoids reading every constant's body on a large repo.
     if (!node.signature || !THUNK_DECL_RE.test(node.signature)) continue;
     const content = ctx.readFile(node.filePath);
-    const src = content && sliceLines(content, node.startLine, node.endLine);
+    const src = content && sliceLines(ctx, node.filePath, content, node.startLine, node.endLine);
     if (!src) continue;
     // Thunks are TS/JS-family (same // and /* */ comment syntax); map to a CommentLang.
     const safe = stripCommentsForRegex(src, node.language === 'javascript' || node.language === 'jsx' ? 'javascript' : 'typescript');
@@ -5338,9 +5343,11 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
     if (matches) return true;
   }
   // Field-backed observers use method-name gates rather than fixed call names.
-  return (content.match(/[A-Za-z_$][\w$]*/g) ?? []).some(
-    (name) => REGISTRAR_NAME.test(name) || DISPATCHER_NAME.test(name)
-  );
+  const words = /[A-Za-z_$][\w$]*/g;
+  for (let word = words.exec(content); word; word = words.exec(content)) {
+    if (REGISTRAR_NAME.test(word[0]) || DISPATCHER_NAME.test(word[0])) return true;
+  }
+  return false;
 }
 
 /**
@@ -5352,7 +5359,7 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
  */
 export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'fieldEdges', gate: ALWAYS, run: (q, c, y) => fieldChannelEdges(q, c, y) },
-  { name: 'closureCollEdges', gate: ALWAYS, run: (q, c, y) => closureCollectionEdges(q, c, y) },
+  { name: 'closureCollEdges', gate: (has) => has('swift', 'kotlin'), run: (q, c, y) => closureCollectionEdges(q, c, y) },
   // Cross-tier channels — a client's `fetch('/api/x')` onto its own route,
   // a queue job onto its consumer, a bus / socket event onto its handler.
   // Before the in-process emitter pass: the same (source, target) pair
@@ -5383,7 +5390,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'kotlinExpectActual', gate: (has) => has('kotlin'), run: (q, _c, y) => kotlinExpectActualEdges(q, y) },
   { name: 'goGrpcEdges', gate: (has) => has('go'), run: (q, _c, y) => goGrpcStubImplEdges(q, y) },
   { name: 'rnEventEdgesList', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => rnEventEdges(c, y) },
-  { name: 'fabricNativeEdges', gate: ALWAYS, run: (_q, c, y) => fabricNativeImplEdges(c, y) },
+  { name: 'fabricNativeEdges', gate: (has) => has('objc', 'kotlin', 'java', 'cpp'), run: (_q, c, y) => fabricNativeImplEdges(c, y) },
   // Expo module nodes (`expo-module:` ids) are emitted only from .swift/.kt
   // files, and a pair needs BOTH platforms — so without both languages the
   // pass's only collection loop is provably empty (it was streaming every
@@ -5501,9 +5508,9 @@ export async function synthesizeCallbackEdges(
   // its own progress the UI freezes at "Resolving refs 100%" for the whole
   // tail — long enough on big repos that users conclude the index hung and
   // kill it. Report each completed pass; the caller surfaces it as its own
-  // progress phase. Emit 0/total up front so the phase flips immediately.
-  // Emissions are throttled to whole-percent movement (each consumes a UI
-  // message); values may be fractional steps from within-pass reporting.
+  // progress phase. Publish 0/total up front so the next animation tick sees
+  // the phase. Whole-percent throttling bounds callback overhead; values may
+  // be fractional steps from within-pass reporting. Callbacks do not redraw.
   let passesDone = 0;
   let lastPct = -1;
   const emit = (value: number): void => {
@@ -5597,6 +5604,7 @@ export async function synthesizeCallbackEdges(
   const runPassOnMain = async (i: number): Promise<void> => {
     const pass = SYNTH_PASSES[i]!;
     const t0 = Date.now();
+    reportCurrentDirectory('.');
     passEdges[i] = await pass.run(queries, ctx, yieldToLoop, subProgress);
     await yieldToLoop();
     markPass(pass.name, Date.now() - t0);
@@ -5689,9 +5697,9 @@ export async function synthesizeCallbackEdges(
     }
   }
   // The passes are done. In a long-lived process (the MCP server, `watch`),
-  // the two line caches would otherwise keep the last file read until the next
-  // synthesis; a pool worker's go with the worker.
-  releaseLineCaches();
+  // line caches would otherwise keep source text until the next synthesis;
+  // a pool worker's go with the worker.
+  releaseLineCaches(ctx);
 
   // A Jest or Vitest manual mock answers only for test code (#2455): whatever
   // pass paired them, production code never links into a `__mocks__/` file.
@@ -5702,12 +5710,19 @@ export async function synthesizeCallbackEdges(
   };
   const merged: Edge[] = [];
   const seen = new Set<string>();
-  for (const e of passEdges.flat()) {
-    const key = `${e.source}>${e.target}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    if (mockNodes.size > 0 && mockNodes.has(e.target) && !fromTestCode(e.source)) continue;
-    merged.push(e);
+  reportCurrentDirectory('.'); // this merge is graph-wide, not the last scanned file
+  let considered = 0;
+  // Keep first-seen REGISTRY order without allocating a second full edge array.
+  for (let i = 0; i < passEdges.length; i++) {
+    for (const e of passEdges[i]!) {
+      if ((++considered & 8191) === 0) await yieldToLoop();
+      const key = `${e.source}>${e.target}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (mockNodes.size > 0 && mockNodes.has(e.target) && !fromTestCode(e.source)) continue;
+      merged.push(e);
+    }
+    passEdges[i] = NONE; // release duplicate-heavy pass buffers before insertion
   }
   __mark('dedupe-merge');
   // Chunked insert with yields: on the Linux kernel the merged synthesized

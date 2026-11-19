@@ -124,8 +124,12 @@ function blankRanges(src: string, blanks: number[]): string {
   return parts.join('');
 }
 
-export function jsxCode(src: string): string | null {
-  return new JsxLexer(src).read();
+/**
+ * `blankJsxText` masks element text for scans of code tokens, rather than tags,
+ * and gives up when a slash could divide or begin a new statement's regex.
+ */
+export function jsxCode(src: string, blankJsxText = false): string | null {
+  return new JsxLexer(src, blankJsxText).read();
 }
 
 /**
@@ -150,7 +154,7 @@ class JsxLexer {
   private afterDot = false;
   private rereads = 0;
 
-  constructor(private readonly src: string) {
+  constructor(private readonly src: string, private readonly blankJsxText: boolean) {
     this.n = src.length;
   }
 
@@ -267,6 +271,10 @@ class JsxLexer {
         return true;
       }
       if (this.exprEnd) {
+        // A tag scan can treat this as division. A token rewrite needs proof:
+        // after `if (...)` or a line-ending `break`, it may open a regex whose
+        // contents look like code. Leave that file to the parser in this mode.
+        if (this.blankJsxText) return false;
         // `/>` among code: an element read as code.
         if (d === 62) return this.reread();
         this.i = i + 1;
@@ -513,6 +521,7 @@ class JsxLexer {
     if (c === 62 || c === 125) return this.reread();
     let end = i + 1;
     for (let e = src.charCodeAt(end); end < this.n && e !== 123 && e !== 60 && e !== 62 && e !== 125; e = src.charCodeAt(++end));
+    if (this.blankJsxText) this.blank(i, end);
     this.i = end;
     return true;
   }

@@ -134,7 +134,7 @@ codegraph init
 
 ### 4. No more syncing!
 
-Auto-sync is enabled by default. CodeGraph watches the project and updates the graph on every file change — while your agent edits code, or you add, modify, or delete files. **The index is never stale, and there is nothing to re-run.**
+Background sync is enabled by default. CodeGraph watches the selected scan directories and coalesces changes at the interval in `.codegraph/config.yaml` (30 seconds by default); periodic rescans also recover missed file events. Run `codegraph sync` to apply changes immediately.
 
 ### Uninstall
 
@@ -564,6 +564,53 @@ codegraph version                 # Print the installed version (also -v, --vers
 codegraph help [command]          # Show help, optionally for one command
 ```
 
+### Indexing progress and linking performance
+
+Interactive `init`, `index`, and `sync` show the directory currently being
+processed next to the phase gauge, for example:
+
+```text
+│  ◆ Parsing code               ━━━━━━━━━━━━━────────────  52% [src/schemas]
+│  ◆ Linking dynamic dispatch   ━━━━━━━━━━━━━━━━━────────  68% [src/subsystems]
+```
+
+Paths are relative to the selected workspace. `[.]` means the workspace root or
+an operation over the whole graph. With parallel workers, the hint is the most
+recently updated **active** worker's directory, not the last completed file or
+one waiting in the queue. Finished and failed workers stop contributing a path.
+
+Directory, phase, count, and percentage changes only update stored state. The
+animation samples the latest values once per existing 150-millisecond shimmer
+tick, including when the main thread is busy; the star's shape still changes
+every third tick. With colors disabled, only those star-shape changes redraw the
+gauge. Processing never triggers a redraw or sends a progress message,
+and there is no separate path or count refresh timer. Updates between ticks are
+coalesced without losing the latest value. Completed-phase lines are buffered and
+printed once when the operation finishes. Long paths are abbreviated to fit and
+terminal control characters are escaped. Redirected output keeps the existing
+plain, per-phase log format.
+
+Linking retains its existing passes, coverage, ordering and confidence rules.
+Source-line slicing uses a bounded per-context cache, callback dispatchers are
+looked up by channel rather than repeatedly scanning the whole candidate list,
+and the final edge merge avoids an extra flattened copy of every pass result.
+
+To diagnose the remaining expensive passes on a particular project:
+
+```bash
+CODEGRAPH_SYNTH_TIMINGS=1 codegraph index
+```
+
+The local synthetic hotspot benchmark can be run against two built revisions:
+
+```bash
+node scripts/benchmark-synthesis-tail.cjs /path/to/baseline/dist
+node scripts/benchmark-synthesis-tail.cjs /path/to/updated/dist
+```
+
+Compare the output edge digests as well as timings. These isolated pass timings
+are not a promise of the same speedup for a complete project index.
+
 ### `codegraph affected`
 
 Traces import dependencies transitively to find which test files are affected by changed source files.
@@ -657,10 +704,61 @@ that drive the graph directly: `DatabaseConnection`, `QueryBuilder`,
 
 ## Configuration
 
-Next to none — CodeGraph is **zero-config by default**, with nothing to write or
-keep in sync to get started. Language support is automatic from the file
-extension; there's nothing to wire up per language. The one optional file is for
-mapping [custom file extensions](#custom-file-extensions).
+CodeGraph creates an editable `.codegraph/config.yaml` when initializing a
+workspace. Commands run from a subdirectory search upward for the **first
+`.codegraph` directory or directory symlink**, stopping **before your home
+directory**. The per-user `~/.codegraph` directory is skipped. Projects outside
+your home directory search up to their filesystem root. A nearer workspace
+without a built index still takes precedence;
+run `codegraph init` there to initialize it. If no marker is found, **the current
+directory is the workspace** and `codegraph init` creates `.codegraph` there.
+CLI commands, MCP startup, and prompt hooks share this rule; indexed child
+projects remain available through an explicit `projectPath`.
+
+```yaml
+# .codegraph/config.yaml
+# Paths are relative to the folder CONTAINING .codegraph, even if it is a symlink.
+directories:
+  - x/y/z
+  - x/w
+  - a/b/c
+
+exclude:
+  - node_modules
+  - "**/generated/**"
+
+background:
+  enabled: true
+  intervalSeconds: 30
+```
+
+`directories` limits full indexing, incremental sync, and background scans to
+the listed directories. It defaults to `[.]`; an empty list indexes nothing.
+Paths must be relative directory names without `..` or glob patterns. Exclusions
+use gitignore-style patterns and apply even to tracked files. Overlapping
+directories are scanned once. Changing the scope removes excluded files from
+the index on the next sync. A workspace at your home directory must explicitly
+list subdirectories; scanning the entire home still requires `--force`.
+
+`background.intervalSeconds` controls automatic rescans and batches of file
+changes while the MCP server is running. The default is 30 seconds; fractional
+seconds are supported. Set `enabled: false` or `intervalSeconds: 0` to turn off
+automatic indexing. Explicit `codegraph sync` and `codegraph index` commands run
+immediately regardless of that setting. Configuration edits are reloaded by the
+running watcher; a periodic scan also recovers changes missed by native events.
+Existing platform watch restrictions and `--no-watch` still apply. Disabling
+background work prevents new automatic syncs; an in-flight sync finishes safely.
+
+The legacy `codegraph.json` remains supported for custom extensions and filtering.
+Filtering lists explicitly present in YAML replace the corresponding JSON lists;
+extension mappings merge by extension key, with YAML taking precedence. Omitted
+settings retain the legacy values. Invalid YAML or an invalid scan directory
+stops indexing with a clear error instead of silently expanding the scope.
+`codegraph init /explicit/path` and `codegraph index /explicit/path` continue to
+target that exact path; bare commands discover the nearest workspace.
+
+Language support is automatic from file extensions. See also
+[custom file extensions](#custom-file-extensions).
 
 What it skips out of the box:
 
@@ -753,16 +851,24 @@ Re-index (`codegraph index`) after adding or changing mappings.
 
 ## Telemetry
 
-CodeGraph collects **anonymous usage statistics** — which tools and commands get
-used, which languages get indexed — to guide where language and agent support
-work goes. **Never** any code, paths, file or symbol names, queries, or IP
-addresses; usage is aggregated locally into daily totals before anything is
-sent, and the ingest endpoint is [public code in this repo](telemetry-worker/)
-that enforces the documented field list. The installer asks up front; turn it
-off any time:
+**Telemetry and automatic external requests are disabled by default**, including
+anonymous usage statistics and GitHub update checks. Disabled telemetry creates
+no machine identifier or event queue and sends no requests. A previous automatic
+first-run notice does not count as consent. The installer defaults to declining
+telemetry, optional downloads, and beta signup.
+
+The npm launcher also uses only an installed or cached platform bundle by
+default. If one is missing, it prints setup guidance. Set
+`CODEGRAPH_ALLOW_DOWNLOAD=1` only when you want that launcher to download a bundle;
+`CODEGRAPH_NO_DOWNLOAD=1` always prevents the fallback download.
+
+You can explicitly enable telemetry with `codegraph telemetry on` or
+`CODEGRAPH_TELEMETRY=1`, and separately enable background release checks with
+`CODEGRAPH_UPDATE_CHECK=1`. To force them off:
 
 ```bash
 codegraph telemetry off    # or: CODEGRAPH_TELEMETRY=0, or DO_NOT_TRACK=1
+export CODEGRAPH_NO_UPDATE_CHECK=1
 ```
 
 To turn it off for one MCP server entry only, such as one in a config you
@@ -770,8 +876,11 @@ share, add `--no-telemetry` to its arguments:
 `codegraph serve --mcp --no-telemetry`. That covers the background server it
 starts too.
 
-[`TELEMETRY.md`](TELEMETRY.md) lists every field, with the off-switches and the
-full data-handling story.
+The MCP server uses **stdio and local IPC only** (Unix-domain sockets or Windows
+named pipes). It opens no auxiliary TCP/HTTP port. The optional browser viewer is
+started only by an explicit `codegraph ui` command. An explicit `codegraph upgrade`
+still downloads an update. [`TELEMETRY.md`](TELEMETRY.md) documents opt-in telemetry
+and every field it may send.
 
 ## Verified releases
 

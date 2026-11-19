@@ -300,7 +300,10 @@ describe('another project this process writes (#2404)', () => {
       const { installMainThreadWatchdog } = require(${JSON.stringify(WATCHDOG)});
       const { acquireProject } = require(${JSON.stringify(LIFECYCLE)});
       const { DatabaseSync } = require('node:sqlite');
-      const graph = { watch: () => true, sync: async () => ({}), close() {}, isIndexing: () => false };
+      const graph = {
+        watch: () => true, sync: async () => ({}), close() {}, isIndexing: () => false,
+        isWatcherPausedByConfig: () => false,
+      };
       installMainThreadWatchdog({ progressPaths: [${JSON.stringify(a.db)}, ${JSON.stringify(`${a.db}-wal`)}] });
       const lease = acquireProject(${JSON.stringify(b.root)}, () => graph, {});
       lease.ready().then(async () => {

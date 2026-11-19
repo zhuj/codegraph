@@ -9,7 +9,9 @@ CodeGraph runs as a [Model Context Protocol](https://modelcontextprotocol.io/) s
 codegraph serve --mcp
 ```
 
-When a `.codegraph/` index exists, the agent gets the tool below. In a workspace with **no** index, the server announces itself inactive and lists **no** tools — the agent works normally with its built-in tools, and indexing stays your decision.
+The server communicates over stdio; its shared daemon uses local Unix-domain sockets or Windows named pipes. It opens no auxiliary TCP/HTTP ports. Telemetry and automatic update checks are disabled unless explicitly enabled.
+
+The server resolves the nearest `.codegraph` directory or directory symlink, searching from its working directory or the client's project path up to the home directory, inclusively. A closer workspace without an initialized index is not skipped. Tools remain available and return initialization guidance for that workspace; indexing stays your decision. Set scan directories, exclusions, and the background sync rate in `.codegraph/config.yaml` as described in [Configuration](/codegraph/getting-started/configuration/).
 
 ## One tool by default: `codegraph_explore`
 

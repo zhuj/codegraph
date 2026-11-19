@@ -1,15 +1,9 @@
 /**
- * MCP workspace sub-project adoption + no-default diagnostics (#1606, #1607).
+ * MCP current-directory fallback and no-default diagnostics.
  *
- * When an MCP host launches the server from a workspace root whose indexed
- * projects live in CHILD directories (a repo container, a monorepo root), the
- * upward walk finds nothing. The server now runs the same bounded down-scan
- * the front-load hook uses:
- *   - exactly ONE indexed sub-project  → adopted as the session's default;
- *   - zero or several                  → no default, but the state is SAID:
- *     stderr names what was searched/found, and tool calls list the indexed
- *     sub-projects so the agent can pass one as `projectPath`;
- *   - non-workspace base (no manifest, no .git) → no scan at all.
+ * With no .codegraph marker at or above cwd, the server retains cwd even
+ * when indexed projects exist beneath it. Tools remain available with
+ * initialization guidance, and a newly initialized cwd is picked up live.
  *
  * Same real-subprocess harness as mcp-roots.test.ts — no mocking.
  */
@@ -91,28 +85,44 @@ async function makeIndexedChild(ws: string, name: string): Promise<string> {
   return dir;
 }
 
-/** initialize (no rootUri, no roots capability) → initialized → codegraph_status. */
-async function driveStatusCall(
+/** initialize without rootUri or a roots capability, then notify initialized. */
+async function initializeSession(
   child: ChildProcessWithoutNullStreams,
   messages: Array<Record<string, any>>,
-): Promise<{ initResult: Record<string, any>; statusText: string }> {
+): Promise<Record<string, any>> {
   send(child, {
     jsonrpc: '2.0', id: 0, method: 'initialize',
     params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: CLIENT_INFO },
   });
   const initResult = await waitForMessage(messages, (m) => m.id === 0 && !!m.result, 5000);
   send(child, { jsonrpc: '2.0', method: 'notifications/initialized' });
-  send(child, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
-  const resp = await waitForMessage(messages, (m) => m.id === 1, 10000);
-  return { initResult, statusText: resp.result.content[0].text as string };
+  return initResult;
 }
 
-describe('MCP workspace sub-project adoption (#1606) + no-default diagnostics (#1607)', () => {
+async function callStatus(
+  child: ChildProcessWithoutNullStreams,
+  messages: Array<Record<string, any>>,
+  id: number,
+): Promise<string> {
+  send(child, { jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
+  const resp = await waitForMessage(messages, (m) => m.id === id, 10000);
+  return resp.result.content[0].text as string;
+}
+
+async function driveStatusCall(
+  child: ChildProcessWithoutNullStreams,
+  messages: Array<Record<string, any>>,
+): Promise<{ initResult: Record<string, any>; statusText: string }> {
+  const initResult = await initializeSession(child, messages);
+  return { initResult, statusText: await callStatus(child, messages, 1) };
+}
+
+describe('MCP keeps cwd when no ancestor workspace exists', () => {
   let ws: string;
   let child: ChildProcessWithoutNullStreams | null = null;
 
   beforeEach(() => {
-    ws = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-ws-'));
+    ws = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-ws-')));
   });
 
   afterEach(async () => {
@@ -127,8 +137,8 @@ describe('MCP workspace sub-project adoption (#1606) + no-default diagnostics (#
     fs.rmSync(ws, { recursive: true, force: true });
   });
 
-  it('adopts the single indexed sub-project below a workspace root as the default project', async () => {
-    fs.mkdirSync(path.join(ws, '.git')); // workspace marker — no manifest needed
+  it('does not adopt a single indexed child, even when cwd has a .git directory', async () => {
+    fs.mkdirSync(path.join(ws, '.git'));
     await makeIndexedChild(ws, 'service-a');
 
     child = spawnServer(ws);
@@ -137,20 +147,19 @@ describe('MCP workspace sub-project adoption (#1606) + no-default diagnostics (#
 
     const { initResult, statusText } = await driveStatusCall(child, messages);
 
-    // The default project works without any projectPath.
-    expect(statusText).toContain('CodeGraph Status');
-    expect(statusText).not.toContain('No CodeGraph project is loaded');
-    // The adoption is announced on stderr (#1607 discoverability).
-    expect(stderr.text()).toContain('adopted the single indexed sub-project');
-    expect(stderr.text()).toContain('service-a');
-    // Instructions match what the engine adopted: the FULL single-project
-    // playbook, not the per-project variant.
+    expect(statusText).toContain('No CodeGraph project is loaded');
+    expect(statusText).toContain(ws);
+    expect(statusText).toContain('codegraph init');
+    expect(statusText).not.toContain('service-a');
+    expect(stderr.text()).toContain('no default project, live sync disabled');
+    expect(stderr.text()).not.toContain('adopted the single indexed sub-project');
+    expect(fs.existsSync(path.join(ws, '.codegraph'))).toBe(false);
     const instructions = initResult.result.instructions as string;
-    expect(instructions).not.toContain('per-project; pass projectPath');
+    expect(instructions).toContain('per-project; pass projectPath');
   }, 20000);
 
-  it('lists several indexed sub-projects instead of adopting one, in stderr and in tool responses', async () => {
-    fs.mkdirSync(path.join(ws, '.git'));
+  it('does not discover or list indexed descendants of a workspace manifest', async () => {
+    fs.writeFileSync(path.join(ws, 'package.json'), '{"private":true,"workspaces":["service-*"]}');
     await makeIndexedChild(ws, 'service-a');
     await makeIndexedChild(ws, 'service-b');
 
@@ -160,24 +169,20 @@ describe('MCP workspace sub-project adoption (#1606) + no-default diagnostics (#
 
     const { initResult, statusText } = await driveStatusCall(child, messages);
 
-    // No default was adopted — ambiguous — but the state is said, not silent.
     expect(statusText).toContain('No CodeGraph project is loaded');
-    // Protocol-reachable listing (#1607): the tool response names what IS there.
-    expect(statusText).toContain('Indexed sub-projects were found below it');
-    expect(statusText).toContain('service-a');
-    expect(statusText).toContain('service-b');
+    expect(statusText).toContain(ws);
+    expect(statusText).not.toContain('Indexed sub-projects were found below it');
+    expect(statusText).not.toContain('service-a');
+    expect(statusText).not.toContain('service-b');
     expect(statusText).toContain('projectPath');
-    // stderr carries the same facts for the host's log.
     expect(stderr.text()).toContain('no default project, live sync disabled');
-    expect(stderr.text()).toContain('Indexed sub-projects found:');
-    // Ambiguous root → per-project instructions variant.
+    expect(stderr.text()).not.toContain('Indexed sub-projects found:');
+    expect(fs.existsSync(path.join(ws, '.codegraph'))).toBe(false);
     const instructions = initResult.result.instructions as string;
     expect(instructions).toContain('per-project; pass projectPath');
   }, 20000);
 
-  it('does not scan below a base that is not a workspace (no manifest, no .git)', async () => {
-    // NO .git and no manifest at ws — the gate must keep the scan off even
-    // though an indexed child exists.
+  it('also keeps an unindexed cwd with no manifest or .git directory', async () => {
     await makeIndexedChild(ws, 'service-a');
 
     child = spawnServer(ws);
@@ -191,4 +196,37 @@ describe('MCP workspace sub-project adoption (#1606) + no-default diagnostics (#
     expect(stderr.text()).toContain('no default project, live sync disabled');
     expect(stderr.text()).not.toContain('Indexed sub-projects found:');
   }, 20000);
+
+  it('ignores a child initialized after startup, then picks up cwd initialized later', async () => {
+    fs.writeFileSync(path.join(ws, 'package.json'), '{"private":true}');
+    child = spawnServer(ws);
+    const messages = collectMessages(child);
+    const stderr = collectStderr(child);
+    const initResult = await initializeSession(child, messages);
+    expect(initResult.result.instructions).toContain('per-project; pass projectPath');
+
+    // Create the child after the handshake and before the first tool call:
+    // this exercises the live retry without relying on a scan-throttle delay.
+    await makeIndexedChild(ws, 'new-child');
+    const withoutRoot = await callStatus(child, messages, 1);
+    expect(withoutRoot).toContain('No CodeGraph project is loaded');
+    expect(withoutRoot).toContain(ws);
+    expect(withoutRoot).not.toContain('new-child');
+    expect(fs.existsSync(path.join(ws, '.codegraph'))).toBe(false);
+
+    fs.writeFileSync(path.join(ws, 'root.py'), 'def workspace_retry_marker():\n    return 1\n');
+    const current = await CodeGraph.init(ws);
+    try { await current.indexFiles(['root.py']); }
+    finally { current.close(); }
+    const initialized = await callStatus(child, messages, 2);
+    expect(initialized).toContain('CodeGraph Status');
+    expect(initialized).not.toContain('No CodeGraph project is loaded');
+    send(child, {
+      jsonrpc: '2.0', id: 3, method: 'tools/call',
+      params: { name: 'codegraph_search', arguments: { query: 'workspace_retry_marker' } },
+    });
+    const search = await waitForMessage(messages, (message) => message.id === 3, 10000);
+    expect(search.result.content[0].text).toContain('workspace_retry_marker');
+    expect(stderr.text()).not.toContain('adopted the single indexed sub-project');
+  }, 30000);
 });

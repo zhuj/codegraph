@@ -187,10 +187,12 @@ describe('the data directory on a Windows drive under WSL', () => {
     expect(codeGraphDirNameFor(root)).toBe('.codegraph-wsl');
   });
 
-  it('does not count a .codegraph with no database as an index', () => {
+  it('discovers an existing .codegraph workspace before its database is built', () => {
     __setWslWindowsDriveForTests(onWslDrive);
     fs.mkdirSync(path.join(root, '.codegraph'));
-    expect(codeGraphDirNameFor(root)).toBe('.codegraph-wsl');
+    expect(codeGraphDirNameFor(root)).toBe('.codegraph');
+    expect(findNearestCodeGraphRoot(path.join(root, 'src'))).toBe(root);
+    expect(isInitialized(root)).toBe(false);
   });
 
   it('lets CODEGRAPH_DIR decide', () => {

@@ -2548,7 +2548,8 @@ function stripJsComments(content: string): string {
       i += 2;
       while (i < content.length && !(content[i] === '*' && content[i + 1] === '/')) i++;
       i += 2;
-      // A space, not nothing: `A/**/as B` must stay two words.
+      // A comment separates tokens: never join `export/**/type`, or turn
+      // `ex/**/port` into a keyword that was not present in the source.
       out += ' ';
       continue;
     }
@@ -2566,6 +2567,7 @@ function stripJsComments(content: string): string {
  *   export { foo as bar } from './a';
  *   export * from './a';
  *   export * as ns from './a';   (treated as wildcard for chasing)
+ *   export type * [as ns] from './a';   (TypeScript type-only re-export)
  *   export { default as Foo } from './a';
  *   and TypeScript's `type` forms of each: `export type { foo } from`,
  *   `export { type foo } from`, `export type * from`.
@@ -2598,6 +2600,7 @@ export function extractReExports(content: string, language: Language): ReExport[
   // Wildcard: `export * from '...'`, optionally `export type *`; `export * as ns
   // from '...'` exports `ns` alone.
   for (const m of cleaned.matchAll(WILDCARD_REEXPORT_RE)) {
+    if (language !== 'typescript' && language !== 'tsx' && language !== 'arkts' && /^export\s+type\b/.test(m[0])) continue;
     // `export * as ns` / `export * as "my ns"` (ES2022) exports the namespace alone.
     const ns = m[1] ?? (m[2] ? m[2].slice(1, -1) : undefined);
     out.push(ns ? { kind: 'namespace', exportedName: ns, source: m[3]! } : { kind: 'wildcard', source: m[3]! });

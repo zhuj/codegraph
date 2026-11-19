@@ -78,7 +78,8 @@ describe('a schema-less codegraph.db is not an initialized project (#1895)', () 
   it.each(['empty', 'no-tables', 'garbage'] as const)('isInitialized() rejects a %s codegraph.db', (kind) => {
     plantBrokenDb(parent, kind);
     expect(isInitialized(parent)).toBe(false);
-    expect(findNearestCodeGraphRoot(child)).toBeNull();
+    // Discovery selects the directory; serving still refuses a missing schema.
+    expect(findNearestCodeGraphRoot(child)).toBe(parent);
     expect(resolveServerRoot(child).root).toBeNull();
     expect(planFrontload(child, 'how does alpha call beta').exploreRoot).toBeNull();
   });
@@ -160,7 +161,7 @@ describe('a schema-less codegraph.db is not an initialized project (#1895)', () 
     expect(explore.out).toContain('alpha');
   });
 
-  it('(a) a workspace container adopts its indexed sub-project even under a schema-less ancestor', async () => {
+  it('(a) a schema-less nearest workspace blocks implicit adoption of another index', async () => {
     // The issue's exact reproduction: ws/ has .git and no index, ws/sub is
     // indexed, and an ancestor of ws carries a zero-table db.
     plantBrokenDb(tmp, 'no-tables');
@@ -170,8 +171,8 @@ describe('a schema-less codegraph.db is not an initialized project (#1895)', () 
     await indexProject(sub);
     fs.writeFileSync(path.join(sub, 'pyproject.toml'), '[project]\nname = "sub"\nversion = "0.1"\n');
     const res = resolveServerRoot(ws);
-    expect(res.root).toBe(sub);
-    expect(res.viaSubScan).toBe(true);
+    expect(res.root).toBeNull();
+    expect(res.viaSubScan).toBe(false);
   });
 
   it('(b) CLI: parent with a schema-less db, child not initialized → not-initialized guidance, never a SQLite error', () => {

@@ -853,17 +853,19 @@ describe('MCP default project in a sensitive folder', () => {
       }
       return base;
     };
-    // Nothing indexed at or above these, so the down-scan below them decides.
+    // These remain selected workspaces, but their sensitive location refuses
+    // serving a default project regardless of indexes in their descendants.
     const one = await workspace(path.join(state.home, '.aws', 'one'), ['only']);
     const two = await workspace(path.join(state.home, '.aws', 'two'), ['a', 'b']);
     expect(resolveServerRoot(one)).toMatchObject({ root: null, candidates: [], refusal: expect.stringMatching(/sensitive directory/i) });
     expect(resolveServerRoot(two)).toMatchObject({ root: null, candidates: [] });
 
-    // The same workspaces elsewhere: the single sub-project is adopted, two are listed.
+    // Ordinary workspaces retain cwd too; their indexed descendants remain
+    // available through an explicit projectPath rather than implicit adoption.
     const okOne = await workspace(path.join(state.tmp, 'elsewhere', 'one'), ['only']);
     const okTwo = await workspace(path.join(state.tmp, 'elsewhere', 'two'), ['a', 'b']);
-    expect(resolveServerRoot(okOne)).toMatchObject({ root: path.join(okOne, 'only'), viaSubScan: true, refusal: null });
-    expect(resolveServerRoot(okTwo).candidates).toHaveLength(2);
+    expect(resolveServerRoot(okOne)).toMatchObject({ workspaceRoot: okOne, root: null, viaSubScan: false, candidates: [], refusal: null });
+    expect(resolveServerRoot(okTwo)).toMatchObject({ workspaceRoot: okTwo, root: null, viaSubScan: false, candidates: [], refusal: null });
   }, 60_000);
 
   // The launcher keys its shared daemon on the root it resolves from the cwd or

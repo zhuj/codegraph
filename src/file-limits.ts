@@ -1,3 +1,4 @@
+import { reportCurrentFile } from './progress-activity';
 import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 
@@ -69,6 +70,7 @@ function assertRegularFile(stats: fs.Stats): void {
  * past the limit. Returns `bytes: null` for an oversize file.
  */
 export async function readBoundedSource(file: string): Promise<BoundedSource> {
+  reportCurrentFile(file);
   const initial = await fsp.stat(file);
   assertRegularFile(initial);
   if (initial.size > MAX_SOURCE_FILE_SIZE_BYTES) return { stats: initial, bytes: null };
@@ -99,6 +101,7 @@ export async function readBoundedSource(file: string): Promise<BoundedSource> {
 
 /** Synchronous {@link readBoundedSource}. */
 export function readBoundedSourceSync(file: string): BoundedSource {
+  reportCurrentFile(file);
   const initial = fs.statSync(file);
   assertRegularFile(initial);
   if (initial.size > MAX_SOURCE_FILE_SIZE_BYTES) return { stats: initial, bytes: null };

@@ -52,6 +52,9 @@ describe('live sync after the index is rebuilt by another process (#1902)', () =
 
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-1902-'));
+    fs.mkdirSync(path.join(root, '.codegraph'));
+    // Rebuild/ownership timing is tested independently of the background rate.
+    fs.writeFileSync(path.join(root, '.codegraph', 'config.yaml'), 'directories: ["."]\n');
     fs.mkdirSync(path.join(root, 'src'));
     fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'export function alpha() { return 1; }\n');
     fs.writeFileSync(path.join(root, 'src', 'b.ts'), 'export function bravo() { return 2; }\n');

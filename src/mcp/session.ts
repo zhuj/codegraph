@@ -275,15 +275,12 @@ export class MCPSession {
       explicitPath = this.explicitProjectPath;
     }
 
-    // Pick the instructions variant by the root's index state — synchronous
-    // and bounded (an existsSync walk-up plus, when that misses, the depth- and
-    // count-bounded workspace down-scan; no DB open, so the #172 respond-fast
-    // contract holds). This is the SAME resolution the engine's doInitialize
-    // runs (#1606), so the variant matches what the engine will actually adopt
-    // — a workspace whose single indexed sub-project becomes the default gets
-    // the full single-project playbook, race-free by construction (both sides
-    // compute it independently; no ordering between handshake and engine init
-    // is assumed). When the root ISN'T indexed (and nothing was adopted), send
+    // Pick the instructions variant by the selected workspace's index state —
+    // a synchronous, bounded walk upward with no descendant scan or DB open,
+    // preserving the #172 respond-fast contract. The engine's doInitialize
+    // runs, so the variant matches the selected nearest/current workspace.
+    // Both sides compute it independently; no ordering between handshake and
+    // engine init is assumed. When the selected workspace ISN'T indexed, send
     // the per-project variant (tools are still exposed — see handleToolsList):
     // it tells the agent there is no default project and to pass `projectPath`
     // to any project that has a `.codegraph/`. Gating tool AVAILABILITY on
@@ -401,9 +398,9 @@ export class MCPSession {
       if (this.engine.hasDefaultCodeGraph()) return;
     }
 
-    // Last resort: walk from the best candidate (sync open). Picks up
-    // projects that appeared after the server started.
-    const candidate = hint ?? process.cwd();
+    // Root negotiation above may have selected an uninitialized workspace.
+    // Refresh the candidate so its path survives retries and later init.
+    const candidate = this.explicitProjectPath ?? this.engine.getProjectPath() ?? process.cwd();
     this.engine.retryInitializeSync(candidate);
   }
 

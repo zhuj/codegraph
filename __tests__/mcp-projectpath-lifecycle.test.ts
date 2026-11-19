@@ -15,6 +15,7 @@ import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
+import { clearProjectConfigCache, getWorkspaceConfigPath } from '../src/project-config';
 import { MCPEngine } from '../src/mcp/engine';
 import { MAX_CACHED_PROJECTS, __setLoadCodeGraphForTests } from '../src/mcp/tools';
 
@@ -37,6 +38,10 @@ async function makeProject(dir: string, symbol: string): Promise<void> {
   fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'src', 'sample.ts'), `export function ${symbol}() { return 1; }\n`);
   const cg = await CodeGraph.init(dir, { config: { include: ['**/*.ts'], exclude: [] } });
+  // Keep these ownership/catch-up tests on the legacy immediate-save policy;
+  // the configurable background cadence has separate integration coverage.
+  fs.writeFileSync(getWorkspaceConfigPath(dir), 'directories: ["."]\n');
+  clearProjectConfigCache();
   await cg.indexAll();
   cg.close();
 }

@@ -4,6 +4,7 @@
  * Prepared statements for CRUD operations on the knowledge graph.
  */
 
+import { reportCurrentFile } from '../progress-activity';
 import { SqliteDatabase, SqliteStatement } from './sqlite-adapter';
 import {
   Node,
@@ -196,6 +197,7 @@ interface UnresolvedRefRow {
  * Convert database row to Node object
  */
 function rowToNode(row: NodeRow): Node {
+  reportCurrentFile(row.file_path);
   return {
     id: row.id,
     kind: row.kind as NodeKind,

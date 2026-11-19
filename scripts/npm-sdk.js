@@ -57,7 +57,8 @@ function resolveLibrary() {
     'Fixes:\n' +
     '  - install from the official npm registry so the matching bundle is fetched:\n' +
     '      npm i @colbymchenry/codegraph --registry=https://registry.npmjs.org\n' +
-    '  - or run the CLI once (e.g. `npx @colbymchenry/codegraph status`) to\n' +
+    '  - or explicitly enable CODEGRAPH_ALLOW_DOWNLOAD=1 and run the CLI once\n' +
+    '    (e.g. `codegraph status`) to\n' +
     '    self-heal the bundle into ~/.codegraph, then require() will find it.'
   );
 }

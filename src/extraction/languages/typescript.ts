@@ -1,6 +1,7 @@
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 import { hasFlowPragma } from '../grammars';
+import { jsxCode } from '../../resolution/jsx-code';
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 
 /**
@@ -85,7 +86,8 @@ const EXPORT_TYPE_STAR = /(^|[;{}]|\*\/)([ \t]*export\s+)type(?=\s*\*\s*(?:from|
  * as an error, so a barrel of re-exports was reported as producing no symbols
  * and counted by `codegraph status` as a file it could not parse, and the
  * kernel handed every such file to the wasm parser (#2474). Only a statement
- * start is blanked, so a mention in a comment or a doc keeps its text. The
+ * start in code is blanked; the shared JSX lexer excludes comments, strings,
+ * nested templates, regex literals and JSX text without changing offsets. The
  * import resolver reads the statement as written, `type` included, from the
  * file itself (`extractReExports`), and so does the import node the statement
  * makes ({@link blanksExportTypeStar}). Applied before both engines parse (the
@@ -93,7 +95,14 @@ const EXPORT_TYPE_STAR = /(^|[;{}]|\*\/)([ \t]*export\s+)type(?=\s*\*\s*(?:from|
  */
 export function blankExportTypeStar(source: string): string {
   if (!EXPORT_TYPE_STAR_HINT.test(source)) return source;
-  return source.replace(EXPORT_TYPE_STAR, '$1$2    ');
+  let code: string | null | undefined;
+  return source.replace(EXPORT_TYPE_STAR, (match, boundary: string, beforeType: string, at: number) => {
+    // Most files do not match the statement pattern at all. Mask only when
+    // needed, once per file, and leave uncertain source to AST recovery.
+    if (code === undefined) code = jsxCode(source, true);
+    const modifier = at + boundary.length + beforeType.length;
+    return code?.slice(modifier, modifier + 4) === 'type' ? boundary + beforeType + '    ' : match;
+  });
 }
 
 /**
@@ -180,6 +189,38 @@ export function isAmbientFunctionSignature(node: SyntaxNode, filePath: string): 
     if (current.type === 'ambient_declaration') ambient = true;
   }
   return ambient || declarationFile;
+}
+
+/**
+ * The bundled TS grammar rejects `export type * [as Name] from '…'`.
+ * It otherwise recognizes that declaration, with just `type` inside ERROR.
+ * Blank only that AST-proven modifier, preserving every source offset. Looking
+ * at top-level export tokens avoids rewriting examples in comments, strings,
+ * templates, regexes or JSX, and leaves malformed declarations unchanged.
+ */
+export function blankTypeOnlyStarExportModifiers(source: string, root: SyntaxNode): string {
+  const positions: number[] = [];
+  for (const statement of root.namedChildren) {
+    if (statement.type !== 'export_statement' || !statement.hasError) continue;
+    const tokens = statement.children.filter((child) => child.type !== 'comment');
+    if (tokens.length !== 5 && !(tokens.length === 6 && tokens[5]!.type === ';')) continue;
+    const [exportToken, modifier, star, from, module] = tokens;
+    if (
+      exportToken?.type !== 'export' || modifier?.type !== 'ERROR' ||
+      modifier.childCount !== 1 || modifier.child(0)?.type !== 'type' ||
+      source.slice(modifier.startIndex, modifier.endIndex) !== 'type' ||
+      (star?.type !== '*' && star?.type !== 'namespace_export') ||
+      star.hasError || star.isMissing || from?.type !== 'from' || from.isMissing ||
+      module?.type !== 'string' || module.hasError || module.isMissing
+    ) continue;
+    positions.push(modifier.startIndex);
+  }
+  // Only the modifier bytes change; comments, module strings and positions survive.
+  for (let i = positions.length - 1; i >= 0; i--) {
+    const start = positions[i]!;
+    source = source.slice(0, start) + '    ' + source.slice(start + 4);
+  }
+  return source;
 }
 
 export const typescriptExtractor: LanguageExtractor = {

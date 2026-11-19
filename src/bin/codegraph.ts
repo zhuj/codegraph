@@ -48,10 +48,10 @@ import { requestedViewerCommand, viewerEnabled } from './viewer-gate';
 // recompiling unchanged sources.
 import '../compile-cache';
 
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, makeGitignoreLocalOnly, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, isCrossSessionMessage, stripSystemReminders, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
+import { getCodeGraphDir, makeGitignoreLocalOnly, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeConfiguredIndexRootReason, findNearestCodeGraphRoot, resolveWorkspaceRoot, planFrontload, isTaskNotification, isAgentMessage, isCrossSessionMessage, stripSystemReminders, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -262,34 +262,12 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
 
 /**
  * Resolve project path from argument or current directory
- * Walks up parent directories to find nearest initialized CodeGraph project
- * (must have .codegraph/codegraph.db, not just .codegraph/lessons.db)
+ * Walks up to the nearest .codegraph directory, stopping before HOME.
+ * A config-only workspace must not be skipped in favor of an ancestor index.
+ * Without a marker, use the requested path or the current directory.
  */
 function resolveProjectPath(pathArg?: string): string {
-  const absolutePath = path.resolve(pathArg || process.cwd());
-
-  // If exact path is initialized (has codegraph.db), use it
-  if (isInitialized(absolutePath)) {
-    return absolutePath;
-  }
-
-  // Walk up to find nearest parent with CodeGraph initialized
-  // Note: findNearestCodeGraphRoot finds any .codegraph folder, but we need one with codegraph.db
-  let current = absolutePath;
-  const root = path.parse(current).root;
-
-  while (current !== root) {
-    const parent = path.dirname(current);
-    if (parent === current) break;
-    current = parent;
-
-    if (isInitialized(current)) {
-      return current;
-    }
-  }
-
-  // Not found - return original path (will fail later with helpful error)
-  return absolutePath;
+  return resolveWorkspaceRoot(pathArg || process.cwd());
 }
 
 /**
@@ -745,7 +723,7 @@ async function runInit(
     // Refuse to index your home directory / a filesystem root — it pulls in
     // caches, other projects, and your whole tree (a multi-GB index + watcher
     // churn, and on pre-1.0 macOS a machine-crashing fd blowup, #845).
-    const unsafe = unsafeIndexRootReason(projectPath);
+    const unsafe = unsafeConfiguredIndexRootReason(projectPath);
     if (unsafe && !options.force) {
       clack.log.error(`Refusing to initialize in ${projectPath} — it looks like ${unsafe}.`);
       clack.log.info('Run this inside a specific project directory, or pass --force if you really mean to index everything under it.');
@@ -755,6 +733,8 @@ async function runInit(
     }
 
     if (isInitialized(projectPath)) {
+      const { ensureWorkspaceConfig } = await import('../workspace-config');
+      ensureWorkspaceConfig(projectPath);
       clack.log.warn(`Already initialized in ${projectPath}`);
       clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
       if (options.localOnly) applyLocalOnlyGitignore(clack, projectPath);
@@ -807,9 +787,8 @@ async function runInit(
           return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
         }
         process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-        const progress = createShimmerProgress();
-        const r = await cg.indexAll({ onProgress: progress.onProgress });
-        await progress.stop();
+        const progress = createShimmerProgress(projectPath);
+        const r = await cg.indexAll({ onProgress: progress.onProgress, activity: progress.activity }).finally(() => progress.stop());
         return r;
       } finally {
         supervision.stop();
@@ -853,7 +832,7 @@ program
   .option('-y, --yes', 'Non-interactive: skip every prompt and take the defaults (for scripts / CI / container bootstraps)')
   .option('--local-only', 'Keep .codegraph/ out of git entirely: its .gitignore ignores itself too. Also converts an initialized project')
   .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean; localOnly?: boolean }) => {
-    await runInit(path.resolve(pathArg || process.cwd()), options);
+    await runInit(pathArg ? path.resolve(pathArg) : resolveProjectPath(), options);
   });
 
 /**
@@ -928,7 +907,7 @@ program
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
     // An EXPLICIT path names the project to rebuild — it is never a hint to go
-    // looking for one. resolveProjectPath walks up to the nearest initialized
+    // looking for one. resolveProjectPath walks up to the nearest workspace
     // ancestor, which is right for `codegraph query` run from a subdirectory,
     // but for a full re-index it silently rebuilt the parent's graph under a
     // normal "Done" when <path> had no index of its own (#1524). Only a bare
@@ -938,7 +917,7 @@ program
     try {
       // Don't (re)index your home directory / a filesystem root (#845). --force
       // doubles as the override.
-      const unsafe = unsafeIndexRootReason(projectPath);
+      const unsafe = unsafeConfiguredIndexRootReason(projectPath);
       if (unsafe && !options.force) {
         error(`Refusing to index ${projectPath} — it looks like ${unsafe}. Pass --force to override.`);
         process.exit(1);
@@ -1010,9 +989,8 @@ program
                 return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
               }
               process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-              const progress = createShimmerProgress();
-              const r = await cg.indexAll({ onProgress: progress.onProgress });
-              await progress.stop();
+              const progress = createShimmerProgress(projectPath);
+              const r = await cg.indexAll({ onProgress: progress.onProgress, activity: progress.activity }).finally(() => progress.stop());
               return r;
             };
 
@@ -1056,7 +1034,8 @@ program
   .command('sync [path]')
   .description('Sync changes since last index')
   .option('-q, --quiet', 'Suppress output (for git hooks)')
-  .action(async (pathArg: string | undefined, options: { quiet?: boolean }) => {
+  .addOption(new Option('--background', 'Honor the workspace background policy (managed Git hooks)').hideHelp())
+  .action(async (pathArg: string | undefined, options: { quiet?: boolean; background?: boolean }) => {
     const projectPath = resolveProjectPath(pathArg);
 
     try {
@@ -1071,6 +1050,11 @@ program
       const cg = await CodeGraph.open(projectPath);
 
       try {
+        if (options.background) {
+          const { runBackgroundSync } = await import('../sync/background-sync');
+          await runBackgroundSync(projectPath, () => cg.sync(), { lastIndexedAt: cg.getLastIndexedAt() });
+          return;
+        }
         if (options.quiet) {
           await cg.sync();
           return;
@@ -1080,10 +1064,11 @@ program
         clack.intro('Syncing CodeGraph');
 
         process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-        const progress = createShimmerProgress();
+        const progress = createShimmerProgress(projectPath);
 
         const result = await cg.sync({
           onProgress: progress.onProgress,
+          activity: progress.activity,
         }).finally(() => progress.stop());
 
         const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
@@ -1694,13 +1679,8 @@ program
       const proseWords = keyworded ? [] : extractProseCandidates(prompt);
       if (!keyworded && codeTokens.length === 0 && proseWords.length === 0) { gate('noop-shape'); return; }
 
-      // Decide what to inject, shaped by WHERE the index(es) are: the nearest
-      // indexed ancestor of cwd, or — when cwd is an un-indexed workspace root
-      // whose indexed project(s) live in sub-dirs (the monorepo case, #964) —
-      // the sub-project the prompt points at, plus a `projectPath` nudge for any
-      // others. Without the down-scan the hook injected nothing at a monorepo
-      // root (it only walked up), so the validated adoption lever never fired
-      // exactly where the agent most needs it.
+      // Use the nearest workspace marker or cwd itself. The hook remains
+      // silent while that workspace is uninitialized, even if children have indexes.
       const plan = planFrontload(String(input.cwd || process.cwd()), prompt);
       if (!plan.exploreRoot && plan.nudgeProjects.length === 0) { gate('noop-no-index'); return; } // nothing reachable — the agent's normal tools apply
 

@@ -1,9 +1,49 @@
 ---
 title: Configuration
-description: CodeGraph is zero-config by default, with one optional codegraph.json for custom extensions, excluding tracked directories, indexing gitignored source, and indexing nested git repositories.
+description: Configure workspace directories, exclusions, and background sync in .codegraph/config.yaml.
 ---
 
-Next to none — CodeGraph is **zero-config by default**, with nothing to write or keep in sync to get started. Language support is automatic from the file extension; there's nothing to wire up per language. The one optional file, `codegraph.json`, covers [custom file extensions](#custom-file-extensions), [excluding tracked directories](#excluding-a-tracked-directory), [indexing gitignored source](#indexing-gitignored-source-a-second-vcs), and [indexing nested git repositories](#indexing-nested-git-repositories).
+CodeGraph creates `.codegraph/config.yaml` when you initialize a workspace. Language support is automatic from file extensions. The legacy `codegraph.json` remains supported for [custom file extensions](#custom-file-extensions), [excluding tracked directories](#excluding-a-tracked-directory), [indexing gitignored source](#indexing-gitignored-source-a-second-vcs), and [indexing nested git repositories](#indexing-nested-git-repositories). Filtering lists explicitly present in YAML replace the corresponding JSON lists; extension mappings merge by extension key, with YAML taking precedence. Omitted settings retain the legacy values.
+
+## Workspace discovery and scan directories
+
+Starting at the current directory, CodeGraph searches upward for the first `.codegraph` directory or directory symlink, stopping **before your home directory**. The per-user `~/.codegraph` directory is skipped. Outside your home, the search stops at the filesystem root. A closer config-only workspace takes precedence over a parent's index; `codegraph init` builds that workspace's first index. Explicit paths to `init` and `index` target that exact directory.
+
+If the search finds no `.codegraph`, the current directory is the workspace. Run `codegraph init` to create its `.codegraph/config.yaml` and index. CLI commands, MCP startup, and prompt hooks all use this fallback. An indexed child does not become the default automatically; query it with an explicit `projectPath`.
+
+```yaml
+# .codegraph/config.yaml
+directories:
+  - x/y/z
+  - x/w
+  - a/b/c
+exclude:
+  - node_modules
+  - "**/generated/**"
+background:
+  enabled: true
+  intervalSeconds: 30
+```
+
+Paths are relative to the folder **containing** `.codegraph`, even when that directory is a symlink to storage elsewhere. They are directory names, not glob patterns; absolute paths and `..` are rejected. Omitting `directories` selects the entire workspace (`[.]`); `directories: []` selects nothing. Overlapping entries are deduplicated. Full index, incremental sync, and the file watcher share this scope, and the next sync removes files that no longer belong to it. A home-level workspace must explicitly select subdirectories to run without `--force`.
+
+Exclusions use gitignore-style patterns. They win over inclusion settings and exclude tracked files too. Built-in dependency/build exclusions and `.gitignore` rules still apply. Selecting a directory does not override those rules; use `include` or `includeIgnored` when needed.
+
+## Background sync rate
+
+`background.intervalSeconds` defaults to 30 seconds and supports fractional seconds. It controls automatic rescans and the rate of automatic file-change batches while the MCP server runs. Only changed files are reparsed; a timer does not rebuild the entire database each time. Native events are coalesced, and periodic rescans recover events the operating system missed. Syncs do not overlap.
+
+Set `background.enabled: false` or `background.intervalSeconds: 0` to disable automatic indexing, including connect-time catch-up. Manual `codegraph sync` and `codegraph index` run immediately. The running watcher reloads config changes, including when the data directory is a symlink. Invalid YAML, unknown settings, and invalid directory paths fail with an error instead of falling back to a broader scan.
+
+These background rescans supplement an active watcher; existing platform restrictions (such as WSL Windows-drive watch suppression) and `CODEGRAPH_NO_WATCH=1` still apply. Disabling background work stops new automatic syncs and lets an in-flight transaction finish. Managed Git sync hooks also honor the configured rate and disabled state; reinstall existing hooks to update their managed command.
+
+Existing projects without a YAML background stanza keep the legacy event debounce until it is configured. New workspace templates explicitly use 30 seconds. Existing user configuration is never overwritten when the template is created.
+
+## Offline defaults
+
+Anonymous telemetry and automatic GitHub update checks are off by default. Telemetry requires `codegraph telemetry on` or `CODEGRAPH_TELEMETRY=1`; background update checks separately require `CODEGRAPH_UPDATE_CHECK=1`. `DO_NOT_TRACK=1` and `CODEGRAPH_NO_UPDATE_CHECK=1` remain deny overrides. The MCP stdio server uses local IPC and opens no auxiliary TCP/HTTP listener. Explicit operations such as `codegraph upgrade` may access the network.
+
+The npm launcher uses an installed or cached platform bundle without network access. If neither is present, it prints setup guidance instead of fetching one. `CODEGRAPH_ALLOW_DOWNLOAD=1` explicitly enables that fallback download; `CODEGRAPH_NO_DOWNLOAD=1` prevents it even when enabled.
 
 ## What it skips out of the box
 

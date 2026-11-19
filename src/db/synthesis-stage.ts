@@ -1,3 +1,4 @@
+import { reportCurrentDirectory } from '../progress-activity';
 import { createDatabase, type SqliteDatabase } from './sqlite-adapter';
 import { QueryBuilder } from './queries';
 import { createYielder } from '../resolution/cooperative-yield';
@@ -51,6 +52,7 @@ export class SynthesisStage {
 
   async publish(backpressure?: () => Promise<void> | null): Promise<void> {
     await backpressure?.();
+    reportCurrentDirectory('.');
     const yieldToLoop = createYielder();
     // Keep the replacement atomic for other connections. Yield between bounded
     // writes, but checkpoint only OUTSIDE this transaction (uncommitted frames

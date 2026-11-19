@@ -149,6 +149,9 @@ describe('Sync Module', () => {
       });
 
       it('watch retains pending edits under a live lock and retries after release (#1361)', async () => {
+        // This case exercises the legacy debounce/backoff path. Explicit
+        // workspace rate limits have their own fake-timer regression suite.
+        fs.writeFileSync(path.join(testDir, '.codegraph', 'config.yaml'), 'directories: [.]\n');
         const lockPath = path.join(testDir, '.codegraph', 'codegraph.lock');
         const sync = vi.spyOn(cg, 'sync');
         const onSyncComplete = vi.fn();

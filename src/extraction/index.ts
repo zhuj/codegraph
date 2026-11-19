@@ -4,6 +4,7 @@
  * Coordinates file scanning, parsing, and database storage.
  */
 
+import { reportCurrentFile, reportCurrentDirectory } from '../progress-activity';
 import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import * as path from 'path';
@@ -25,7 +26,7 @@ import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
-import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
+import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, loadScanDirectories, matchesScanDirectories, getWorkspaceConfigPath, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath, isMissingPathError, escapesRoot } from '../utils';
@@ -783,8 +784,10 @@ function collectIncludedFiles(
   const out = new Set<string>();
   const defaults = defaultsOnlyIgnore();
   const visited = new Set<string>();
+  const selected = loadScanDirectories(rootDir);
 
   const consider = (abs: string, rel: string, isDir: boolean): void => {
+    if (!matchesScanDirectories(rel, selected, isDir)) return;
     if (isDir) {
       if (defaults.ignores(rel + '/')) return; // never node_modules/dist/… via include
       // An explicit `exclude` always wins over `include`; prune the whole subtree
@@ -837,6 +840,7 @@ function collectIncludedFiles(
   }
 
   for (const root of roots) {
+    if (!matchesScanDirectories(root, selected, true)) continue;
     walk(root === '' ? rootDir : path.join(rootDir, root));
   }
   return out;
@@ -940,7 +944,7 @@ function classifyGitDir(absDir: string): 'embedded' | 'worktree' | 'none' {
  * from npm git-dependencies — that never makes it project code) and CodeGraph
  * data dirs. Depth- and entry-capped so a huge ignored tree can't stall the scan.
  */
-function findNestedGitRepos(absDir: string, relPrefix: string): string[] {
+function findNestedGitRepos(absDir: string, relPrefix: string, canVisit?: (rel: string) => boolean): string[] {
   const found: string[] = [];
   const defaults = defaultsOnlyIgnore();
   const queue: Array<{ abs: string; rel: string; depth: number }> = [
@@ -949,6 +953,7 @@ function findNestedGitRepos(absDir: string, relPrefix: string): string[] {
   let examined = 0;
   while (queue.length > 0) {
     const { abs, rel, depth } = queue.shift()!;
+    if (canVisit && !canVisit(rel)) continue;
     if (++examined > EMBEDDED_REPO_SEARCH_ENTRIES) {
       logDebug('Embedded-repo search entry cap hit — deeper repos (if any) not discovered', { under: relPrefix });
       break;
@@ -1061,6 +1066,8 @@ export class ScopeIgnore {
      * folder named `[draft]` or `a[b` read as a glob (or did not compile).
      */
     private gitIgnoredDirs: ReadonlySet<string> = new Set(),
+    /** Explicit workspace directory allowlist; applies before every include. */
+    private scanDirectories: string[] = ['.'],
   ) {
     // Longest root first so paths in nested embedded repos hit the innermost matcher.
     this.embedded = [...embedded].sort((a, b) => b.root.length - a.root.length);
@@ -1076,6 +1083,7 @@ export class ScopeIgnore {
   }
 
   ignores(rel: string): boolean {
+    if (!matchesScanDirectories(rel, this.scanDirectories, rel.endsWith('/'))) return true;
     // User `exclude` (#999) is checked first and against the full root-relative
     // path: it must drop git-TRACKED paths (which `.gitignore` can't) and apply
     // everywhere, including ancestors of embedded repos.
@@ -1116,6 +1124,7 @@ export class ScopeIgnore {
  * skip rediscovery; otherwise they're discovered here (the watcher path).
  */
 export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<string>, ignoredEntries?: string[]): ScopeIgnore {
+  const selected = loadScanDirectories(rootDir);
   const roots = embeddedRoots ? [...embeddedRoots] : discoverEmbeddedRepoRoots(rootDir);
   const include = loadIncludeMatcher(rootDir);
   // The root matcher has defaults + root `.gitignore` + info/exclude +
@@ -1129,6 +1138,7 @@ export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<strin
     include,
     include ? includeStaticRoots(loadIncludePatterns(rootDir)) : [],
     new Set(listGitIgnoredDirectories(rootDir, ignoredEntries)),
+    selected,
   );
 }
 
@@ -1176,6 +1186,7 @@ function gitlinkEmbeddedRepoSkipped(
  * there already.
  */
 export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
+  const selected = loadScanDirectories(rootDir);
   try {
     execFileSync('git', ['rev-parse', '--git-dir'], { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   } catch {
@@ -1194,7 +1205,8 @@ export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
       );
       for (const e of o.split('\0')) {
         if (e.endsWith('/') && !isWholeCwdEntry(e) && !defaults.ignores(e)) {
-          candidates.push(...findNestedGitRepos(path.join(repoAbs, e), e));
+          candidates.push(...findNestedGitRepos(path.join(repoAbs, e), e,
+            (rel) => matchesScanDirectories(prefix + rel, selected, true)));
         }
       }
     } catch { /* untracked listing failed — ignored-side discovery still runs */ }
@@ -1214,13 +1226,14 @@ export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
         if (tab === -1) continue;
         const rel = entry.slice(tab + 1);
         const relDir = rel.endsWith('/') ? rel : rel + '/';
+        if (!matchesScanDirectories(prefix + relDir, selected, true)) continue;
         // A gitlink under a gitignored path is respected (not indexed) unless the
         // project opted it in — same rule as the untracked-ignored kind (#1065).
         if (gitlinkEmbeddedRepoSkipped(relDir, prefix, defaults, repoIgnore, includeIgnored)) continue;
         if (classifyGitDir(path.join(repoAbs, rel)) === 'embedded') candidates.push(relDir);
       }
     } catch { /* staged listing failed — other discovery still runs */ }
-    candidates.push(...findIgnoredEmbeddedRepos(repoAbs, includeIgnored, prefix));
+    candidates.push(...findIgnoredEmbeddedRepos(repoAbs, includeIgnored, prefix, selected));
     for (const rel of candidates) {
       const full = normalizePath(prefix + rel);
       out.push(full);
@@ -1254,6 +1267,7 @@ const UNINDEXED_IGNORED_REPO_HINT_CAP = 100;
  * on a giant ignored tree.
  */
 export function findUnindexedIgnoredRepos(rootDir: string): string[] {
+  const selected = loadScanDirectories(rootDir);
   try {
     execFileSync('git', ['rev-parse', '--git-dir'], { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   } catch {
@@ -1265,7 +1279,8 @@ export function findUnindexedIgnoredRepos(rootDir: string): string[] {
   for (const dir of listIgnoredDirs(rootDir)) {
     if (defaults.ignores(dir)) continue; // node_modules etc. — never project code
     if (includeIgnored?.ignores(normalizePath(dir))) continue; // already opted in — nothing to nag about
-    for (const repo of findNestedGitRepos(path.join(rootDir, dir), dir)) {
+    for (const repo of findNestedGitRepos(path.join(rootDir, dir), dir,
+      (rel) => matchesScanDirectories(rel, selected, true))) {
       // Per-repo opt-in check, mirroring findIgnoredEmbeddedRepos: a child
       // pattern (`repos/a/`) doesn't match the parent dir above but DOES
       // cover this repo — it's indexed, so don't nag about it (#1295).
@@ -1304,13 +1319,14 @@ export function includeIgnoredPatternFor(repoDir: string): string {
  * `services/` opts that whole subtree in at any recursion depth. Built-in
  * default excludes (`node_modules`, …) are always skipped.
  */
-function findIgnoredEmbeddedRepos(repoDir: string, includeIgnored: Ignore | null, prefix: string): string[] {
+function findIgnoredEmbeddedRepos(repoDir: string, includeIgnored: Ignore | null, prefix: string, selected: readonly string[] = ['.']): string[] {
   if (!includeIgnored) return [];
   const defaults = defaultsOnlyIgnore();
   const repos: string[] = [];
   for (const dir of listIgnoredDirs(repoDir)) {
     if (defaults.ignores(dir)) continue;
-    const nested = findNestedGitRepos(path.join(repoDir, dir), dir);
+    const nested = findNestedGitRepos(path.join(repoDir, dir), dir,
+      (rel) => matchesScanDirectories(prefix + rel, selected, true));
     if (includeIgnored.ignores(normalizePath(prefix + dir))) {
       // The whole ignored dir is opted in — every nested repo under it counts.
       repos.push(...nested);
@@ -1377,7 +1393,9 @@ function isGitlinkEntry(entry: string): boolean {
  * found) is recorded in `embeddedRoots` so callers can exempt its files from the
  * parent's own gitignore rules.
  */
-function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, embeddedRoots?: Set<string>, includeIgnored: Ignore | null = null, gitlinks?: string[]): void {
+function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, embeddedRoots?: Set<string>, includeIgnored: Ignore | null = null, gitlinks?: string[], selected: readonly string[] = ['.']): void {
+  reportCurrentDirectory(repoDir);
+  if (!matchesScanDirectories(prefix, selected, true)) return;
   const gitOpts = { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'], windowsHide: true };
 
   // Tracked files. --recurse-submodules pulls in files from active submodules,
@@ -1423,7 +1441,7 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
       continue;
     }
     if (entry[0] === 'S' && !fs.existsSync(path.join(repoDir, rel))) continue;
-    files.add(normalizePath(prefix + rel));
+    if (matchesScanDirectories(prefix + rel, selected)) files.add(normalizePath(prefix + rel));
   }
 
   // Untracked files (submodules manage their own untracked state). Embedded git
@@ -1443,11 +1461,11 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
       // it's a duplicate working view of an already-indexed repo (#848).
       if (classifyGitDir(childDir) === 'embedded' && !defaultsOnlyIgnore().ignores(rel)) {
         embeddedRoots?.add(normalizePath(prefix + rel));
-        collectGitFiles(childDir, prefix + rel, files, embeddedRoots, includeIgnored);
+        collectGitFiles(childDir, prefix + rel, files, embeddedRoots, includeIgnored, gitlinks, selected);
       }
       continue;
     }
-    files.add(normalizePath(prefix + rel));
+    if (matchesScanDirectories(prefix + rel, selected)) files.add(normalizePath(prefix + rel));
   }
 
   // Gitlink entries (mode 160000) that --recurse-submodules left unexpanded —
@@ -1463,6 +1481,7 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
     const repoIgnore = buildDefaultIgnore(repoDir);
     for (const rel of gitlinkRels) {
       const relDir = rel.endsWith('/') ? rel : rel + '/';
+      if (!matchesScanDirectories(prefix + relDir, selected, true)) continue;
       // A gitlink under a gitignored path is respected (not indexed) unless the
       // project opted it in via `includeIgnored` — keep tracked gitlinks under
       // the same scope rule as the untracked-ignored kind below (#1065).
@@ -1471,7 +1490,7 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
       // 'embedded' = a real .git checkout on disk; 'worktree' and 'none' are skipped.
       if (classifyGitDir(childDir) !== 'embedded') continue;
       embeddedRoots?.add(normalizePath(prefix + relDir));
-      collectGitFiles(childDir, prefix + relDir, files, embeddedRoots, includeIgnored);
+      collectGitFiles(childDir, prefix + relDir, files, embeddedRoots, includeIgnored, gitlinks, selected);
     }
   }
 
@@ -1480,9 +1499,9 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
   // stay hidden — `.gitignore` is respected (#970, #976). They are recursed into
   // only when the project opted the directory in via `codegraph.json`
   // `includeIgnored` (#622, #699), which `findIgnoredEmbeddedRepos` enforces.
-  for (const rel of findIgnoredEmbeddedRepos(repoDir, includeIgnored, prefix)) {
+  for (const rel of findIgnoredEmbeddedRepos(repoDir, includeIgnored, prefix, selected)) {
     embeddedRoots?.add(normalizePath(prefix + rel));
-    collectGitFiles(path.join(repoDir, rel), prefix + rel, files, embeddedRoots, includeIgnored);
+    collectGitFiles(path.join(repoDir, rel), prefix + rel, files, embeddedRoots, includeIgnored, gitlinks, selected);
   }
 }
 
@@ -1540,6 +1559,7 @@ function gitRepoPrefix(dir: string): string {
  * (non-git project) so callers can fall back to a filesystem walk.
  */
 function getGitVisibleFiles(rootDir: string, onManifestEvidence?: (evidence: ManifestEvidence) => void): Set<string> | null {
+  reportCurrentDirectory(rootDir);
   try {
     // Check if the project directory is gitignored by a parent repo.
     // When rootDir lives inside a parent git repo that ignores it,
@@ -1562,7 +1582,8 @@ function getGitVisibleFiles(rootDir: string, onManifestEvidence?: (evidence: Man
     const files = new Set<string>();
     const embeddedRoots = new Set<string>();
     const gitlinks: string[] = [];
-    collectGitFiles(rootDir, '', files, embeddedRoots, loadIncludeIgnoredMatcher(rootDir), gitlinks);
+    const selected = loadScanDirectories(rootDir);
+    collectGitFiles(rootDir, '', files, embeddedRoots, loadIncludeIgnoredMatcher(rootDir), gitlinks, selected);
     // Apply built-in default ignores uniformly — to tracked files too, since
     // committing a dependency/build dir doesn't make it project code. A
     // `.gitignore` negation (e.g. `!vendor/`) is the explicit opt-in. (issue #407)
@@ -1576,8 +1597,10 @@ function getGitVisibleFiles(rootDir: string, onManifestEvidence?: (evidence: Man
     // lists, before any scope rule, and what it ignores. A full sync compares
     // it with what the last walk found (see trustedManifestList).
     if (onManifestEvidence) {
+      // Directory allowlists filter `files` during collection. A narrow list
+      // cannot certify all workspace manifests, so retain discovery fallback.
       onManifestEvidence(manifestEvidence(rootDir, files, ignoredEntries!,
-        embeddedRoots.size === 0 && gitlinks.length === 0 && !fs.existsSync(path.join(gitRoot, '.gitmodules'))));
+        selected.includes('.') && embeddedRoots.size === 0 && gitlinks.length === 0 && !fs.existsSync(path.join(gitRoot, '.gitmodules'))));
     }
     const visible = new Set([...files].filter((f) => !ig.ignores(f)));
     // Force-include first-party source the project whitelisted in
@@ -1650,7 +1673,7 @@ export function getGitChangedFiles(rootDir: string, sinceCommit?: string | null)
     // does, so callers take the full scan that indexed the project.
     const repoPrefix = gitRepoPrefix(rootDir);
     if (repoPrefix && isIgnoredByEnclosingRepo(rootDir)) return null;
-    collectGitStatus(rootDir, '', changes, isSource, loadIncludeIgnoredMatcher(rootDir), loadExcludeMatcher(rootDir), sinceCommit ?? undefined, repoPrefix);
+    collectGitStatus(rootDir, '', changes, isSource, loadIncludeIgnoredMatcher(rootDir), loadExcludeMatcher(rootDir), sinceCommit ?? undefined, repoPrefix, loadScanDirectories(rootDir));
     return changes;
   } catch {
     return null;
@@ -1736,7 +1759,9 @@ export function canTrustGitFastPath(rootDir: string, sinceCommit?: string | null
  * '' for a repository root, which every embedded repo below is, and the
  * folder's path from the root (`app/`) for a project below it (#1636).
  */
-function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSource: (filePath: string) => boolean, includeIgnored: Ignore | null = null, exclude: Ignore | null = null, sinceCommit?: string, repoPrefix = ''): void {
+function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSource: (filePath: string) => boolean, includeIgnored: Ignore | null = null, exclude: Ignore | null = null, sinceCommit?: string, repoPrefix = '', selected: readonly string[] = ['.']): void {
+  reportCurrentDirectory(repoDir);
+  if (!matchesScanDirectories(prefix, selected, true)) return;
   const output = execFileSync(
     'git',
     // `-uall` lists individual untracked files instead of collapsing an
@@ -1779,6 +1804,7 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSo
       out.deleted.push(filePath);
       return;
     }
+    if (!matchesScanDirectories(filePath, selected)) return;
 
     // Added (`??`) / modified files inside an excluded dir must not enter the
     // index — match against the `repoDir`-relative path, same as the full scan. (#766)
@@ -1839,12 +1865,13 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSo
   // project opted in via `includeIgnored`; by default `.gitignore` is respected
   // and they are left alone (#970, #976), mirroring the full-index scan.
   for (const rel of untrackedDirs) {
-    for (const repoRel of findNestedGitRepos(path.join(repoDir, rel), rel)) {
-      collectGitStatus(path.join(repoDir, repoRel), prefix + repoRel, out, isSource, includeIgnored, exclude);
+    for (const repoRel of findNestedGitRepos(path.join(repoDir, rel), rel,
+      (nested) => matchesScanDirectories(prefix + nested, selected, true))) {
+      collectGitStatus(path.join(repoDir, repoRel), prefix + repoRel, out, isSource, includeIgnored, exclude, undefined, '', selected);
     }
   }
-  for (const rel of findIgnoredEmbeddedRepos(repoDir, includeIgnored, prefix)) {
-    collectGitStatus(path.join(repoDir, rel), prefix + rel, out, isSource, includeIgnored, exclude);
+  for (const rel of findIgnoredEmbeddedRepos(repoDir, includeIgnored, prefix, selected)) {
+    collectGitStatus(path.join(repoDir, rel), prefix + rel, out, isSource, includeIgnored, exclude, undefined, '', selected);
   }
 }
 
@@ -1868,6 +1895,7 @@ export function scanDirectory(
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
+      reportCurrentFile(filePath);
       if (isSourceFile(filePath, overrides, rootDir)) {
         files.push(filePath);
         count++;
@@ -1921,6 +1949,7 @@ export async function scanDirectoryAsync(
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
+      reportCurrentFile(filePath);
       if (isSourceFile(filePath, overrides, rootDir)) {
         files.push(filePath);
         count++;
@@ -1950,6 +1979,7 @@ function scanDirectoryWalk(
   const files: string[] = [];
   let count = 0;
   const visitedDirs = new Set<string>();
+  const selected = loadScanDirectories(rootDir);
   // Custom extension → language overrides from the project's codegraph.json.
   const overrides = loadExtensionOverrides(rootDir);
 
@@ -1973,6 +2003,7 @@ function scanDirectoryWalk(
   };
 
   const isIgnored = (fullPath: string, isDir: boolean, matchers: ScopedIgnore[]): boolean => {
+    if (!matchesScanDirectories(normalizePath(path.relative(rootDir, fullPath)), selected, isDir)) return true;
     for (const { dir, ig } of matchers) {
       let rel = normalizePath(path.relative(dir, fullPath));
       if (!rel || escapesRoot(rel)) continue; // not under this matcher's dir
@@ -1983,6 +2014,7 @@ function scanDirectoryWalk(
   };
 
   function walk(dir: string, matchers: ScopedIgnore[]): void {
+    reportCurrentDirectory(dir);
     let realDir: string;
     try {
       realDir = fs.realpathSync(dir);
@@ -2017,6 +2049,7 @@ function scanDirectoryWalk(
       if (entry.name === '.git' || isCodeGraphDataDir(entry.name)) continue;
 
       const fullPath = path.join(dir, entry.name);
+      reportCurrentFile(fullPath);
       const relativePath = normalizePath(path.relative(rootDir, fullPath));
 
       if (entry.isSymbolicLink()) {
@@ -2211,6 +2244,24 @@ export class ExtractionOrchestrator {
     this.queries = queries;
   }
 
+  /** Scope is independent of Git: config.yaml lives in the ignored data dir. */
+  private scopeFingerprint(): string {
+    return crypto.createHash('sha256').update(JSON.stringify({
+      directories: loadScanDirectories(this.rootDir),
+      exclude: loadExcludePatterns(this.rootDir),
+      include: loadIncludePatterns(this.rootDir),
+      includeIgnored: loadIncludeIgnoredPatterns(this.rootDir),
+    })).digest('hex');
+  }
+
+  private removeIndexedFile(filePath: string): void {
+    const incoming = this.queries.getCrossFileIncomingEdgesWithTarget(filePath);
+    const refs = incoming.map((edge) => resurrectRefFromDroppedEdge(edge))
+      .filter((ref): ref is UnresolvedReference => ref !== null);
+    if (refs.length > 0) this.queries.insertUnresolvedRefsBatch(refs);
+    this.queries.deleteFile(filePath);
+  }
+
   /**
    * The scope matcher a scoped sync applies to the paths it was handed — the
    * same `buildScopeIgnore` the full scan uses, so an explicitly-passed path
@@ -2232,6 +2283,7 @@ export class ExtractionOrchestrator {
     const gitDir = resolveGitDir(this.rootDir);
     const key = [
       PROJECT_CONFIG_FILENAME,
+      getWorkspaceConfigPath(this.rootDir),
       '.gitignore',
       gitDir ? path.join(gitDir, 'info', 'exclude') : '',
     ]
@@ -2525,6 +2577,7 @@ export class ExtractionOrchestrator {
     // early-run 5-10s single stalls were observed on 95k-file repos but never
     // attributed — these labels settle scan vs framework-detect vs grammars.
     const tScan = Date.now();
+    const scopeFingerprint = this.scopeFingerprint();
     const skipStats: ScanSkipStats = { unsupportedByExtension: new Map() };
     this.manifestEvidence = null;
     const files = await scanDirectoryAsync(this.rootDir, (current, file) => {
@@ -2577,6 +2630,15 @@ export class ExtractionOrchestrator {
         errors: [{ message: 'Aborted', severity: 'error' }],
         durationMs: Date.now() - startTime,
       };
+    }
+
+    // Re-indexing an existing workspace must remove rows whose directories
+    // were deselected or excluded. Preserve surviving callers as unresolved
+    // references, matching incremental sync's removal behavior.
+    const scanFiles = new Set(files);
+    for (const tracked of this.queries.getAllFiles()) {
+      if (scanFiles.has(tracked.path) && fs.existsSync(path.join(this.rootDir, tracked.path))) continue;
+      this.removeIndexedFile(tracked.path);
     }
 
     // Phase 2: Parse files in a worker thread (keeps main thread unblocked for UI)
@@ -2670,7 +2732,10 @@ export class ExtractionOrchestrator {
     const parseFile = (filePath: string, content: string): Promise<ExtractionResult> => {
       const language = detectLanguage(filePath, content, overrides, this.rootDir);
       const names = this.frameworksForFile(filePath, frameworkNames);
-      if (!pool) return Promise.resolve(extractFromSource(filePath, content, language, names));
+      if (!pool) {
+        reportCurrentFile(filePath);
+        return Promise.resolve(extractFromSource(filePath, content, language, names));
+      }
       return pool.requestParse({ filePath, content, language, frameworkNames: names });
     };
 
@@ -3154,6 +3219,8 @@ export class ExtractionOrchestrator {
     // Shut down the parse worker pool.
     if (pool) await pool.destroy();
 
+    if (!signal?.aborted) this.queries.setMetadata('indexed_scope_config', scopeFingerprint);
+
     return {
       success: filesIndexed > 0 || errors.filter((e) => e.severity === 'error').length === 0,
       filesIndexed,
@@ -3231,6 +3298,22 @@ export class ExtractionOrchestrator {
         unresolvedReferences: [],
         errors: [{ message: `Path traversal blocked: ${relativePath}`, filePath: relativePath, severity: 'error', code: 'path_traversal' }],
         durationMs: 0,
+      };
+    }
+
+    // The explicit-file API must honor the same user-defined directory and
+    // exclusion boundary as full indexing and sync. Preserve its historic
+    // handling of .gitignore/default ignores when no restriction was set.
+    // Match the logical workspace path, not a symlink target's real path.
+    const relative = normalizePath(path.relative(this.rootDir, path.resolve(this.rootDir, relativePath)));
+    const selected = loadScanDirectories(this.rootDir);
+    const exclude = loadExcludeMatcher(this.rootDir);
+    if (!matchesScanDirectories(relative, selected) || exclude?.ignores(relative)) {
+      this.removeIndexedFile(relativePath);
+      return {
+        nodes: [], edges: [], unresolvedReferences: [], durationMs: 0,
+        errors: [{ message: `Skipped file outside the configured scan scope: ${relativePath}`,
+          filePath: relativePath, severity: 'warning', code: 'outside_scope' }],
       };
     }
 
@@ -3329,6 +3412,7 @@ export class ExtractionOrchestrator {
     // otherwise detect on the spot so single-file re-index paths still emit
     // route nodes / middleware / etc.
     const frameworkNames = this.frameworksForFile(relativePath, this.ensureDetectedFrameworks());
+    reportCurrentFile(relativePath);
     const result = extractFromSource(relativePath, content, language, frameworkNames);
 
     // Store in database
@@ -3860,6 +3944,14 @@ export class ExtractionOrchestrator {
   ): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     const startTime = Date.now();
+    const scopeFingerprint = this.scopeFingerprint();
+    const indexedScope = this.queries.getMetadata('indexed_scope_config');
+    if (indexedScope !== scopeFingerprint) {
+      // A directory/exclusion edit affects the whole stored inventory, even
+      // if the OS reported only one unrelated source-file event. An older
+      // index without a scope stamp also needs one full reconciliation.
+      scopedPaths = undefined;
+    }
     let filesChecked = 0;
     let filesAdded = 0;
     let filesModified = 0;
@@ -3936,7 +4028,9 @@ export class ExtractionOrchestrator {
       // visible to the next scoped sync (#1728).
       this.scopedMatcher = null;
       this.manifestEvidence = null;
-      currentFiles = await scanDirectoryAsync(this.rootDir, undefined, undefined, (evidence) => { this.manifestEvidence = evidence; });
+      currentFiles = await scanDirectoryAsync(this.rootDir, (current, file) => {
+        onProgress?.({ phase: 'scanning', current, total: 0, currentFile: file });
+      }, undefined, (evidence) => { this.manifestEvidence = evidence; });
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scan: ${Date.now() - tSyncScan}ms (${currentFiles.length} files)`);
       filesChecked = currentFiles.length;
 
@@ -3987,6 +4081,7 @@ export class ExtractionOrchestrator {
     };
     const removed: FileRecord[] = [];
     for (const tracked of trackedFiles) {
+      reportCurrentFile(tracked.path);
       if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
         removed.push(tracked);
       }
@@ -4013,6 +4108,7 @@ export class ExtractionOrchestrator {
 
     // Adds / modifications.
     for (const filePath of currentFiles) {
+      reportCurrentFile(filePath);
       // Same cooperative yield as the removals loop — this is the other O(files)
       // synchronous-stat loop that wedges the main thread on a large repo (#905).
       // Yield at the top of the body so the `continue` fast-paths below still hit it.
@@ -4169,6 +4265,10 @@ export class ExtractionOrchestrator {
       }
     }
 
+    if (!scopedPaths || scopedPaths.length === 0) {
+      this.queries.setMetadata('indexed_scope_config', scopeFingerprint);
+    }
+
     return {
       filesChecked,
       filesAdded,
@@ -4264,7 +4364,8 @@ export class ExtractionOrchestrator {
     let sinceCommit: string | null = null;
     try { sinceCommit = this.queries.getMetadata(INDEXED_AT_COMMIT_KEY) ?? null; } catch { /* advisory */ }
     const dirtyPaths = this.indexedDirtyPaths(sinceCommit);
-    const gitChanges = dirtyPaths !== null && canTrustGitFastPath(this.rootDir, sinceCommit)
+    const scopeCurrent = this.queries.getMetadata('indexed_scope_config') === this.scopeFingerprint();
+    const gitChanges = scopeCurrent && dirtyPaths !== null && canTrustGitFastPath(this.rootDir, sinceCommit)
       ? getGitChangedFiles(this.rootDir, sinceCommit)
       : null;
 
@@ -4322,6 +4423,7 @@ export class ExtractionOrchestrator {
 
     // Find removed files
     for (const tracked of trackedFiles) {
+      reportCurrentFile(tracked.path);
       if (!currentFiles.has(tracked.path)) {
         removed.push(tracked.path);
       }
@@ -4329,6 +4431,7 @@ export class ExtractionOrchestrator {
 
     // Find added and modified files
     for (const filePath of currentFiles) {
+      reportCurrentFile(filePath);
       const fullPath = path.join(this.rootDir, filePath);
       let content: string | null;
       try {

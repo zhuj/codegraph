@@ -50,7 +50,8 @@ describe('git sync hooks', () => {
       const file = path.join(repo, '.git', 'hooks', hook);
       expect(fs.existsSync(file)).toBe(true);
       const body = fs.readFileSync(file, 'utf8');
-      expect(body).toContain('codegraph sync');
+      expect(body).toContain('codegraph sync ');
+      expect(body).toContain(' --background --quiet');
       expect(body).toContain('command -v codegraph'); // no-op when not on PATH
       expect(isExecutable(file)).toBe(true);
     }
@@ -183,7 +184,7 @@ describe('git sync hooks — project roots and existing hooks', () => {
     // git runs hooks from the top of the work tree
     const calls = runHookWithFakeCodegraph(hookFile(), repo);
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toContain(`args=sync ${sub}`);
+    expect(calls[0]).toContain(`args=sync ${sub} --background --quiet`);
   });
 
   it('keeps one block per project root, and removes only its own', () => {

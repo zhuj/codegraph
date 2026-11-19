@@ -2,10 +2,10 @@
  * Front-load hook project resolution (#964).
  *
  * The Claude `UserPromptSubmit` front-load hook must inject CodeGraph context
- * for the RIGHT project — including the monorepo case where the agent's cwd is
- * an un-indexed workspace root and the index lives in a sub-project. These test
- * `planFrontload` / `findIndexedSubprojectRoots` directly (the hook's decision
- * logic), plus the built CLI's confidence tiers against a real index.
+ * for the nearest ancestor workspace, falling back to cwd when none exists.
+ * Indexed descendants must never silently replace an unindexed cwd. These
+ * test `planFrontload` and the standalone subproject scan utility directly,
+ * plus the built CLI's confidence tiers against a real index.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
@@ -28,7 +28,7 @@ function mkIndexed(dir: string): string {
   CodeGraph.initSync(dir).close();
   return dir;
 }
-/** A workspace-root manifest so the down-scan gate (looksLikeProjectRoot) passes. */
+/** A workspace-root manifest must not enable implicit descendant adoption. */
 function mkWorkspaceRoot(dir: string): string {
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'package.json'), '{"private":true,"workspaces":["packages/*"]}');
@@ -89,45 +89,39 @@ describe('planFrontload — front-load hook project resolution (#964)', () => {
     expect(planFrontload(nested, 'trace the flow').exploreRoot).toBe(tmp);
   });
 
-  it('un-indexed workspace root with ONE indexed sub-project → front-load it (the #964 case)', () => {
-    mkWorkspaceRoot(tmp);
-    const api = mkIndexed(path.join(tmp, 'packages', 'api'));
-    const plan = planFrontload(tmp, 'how does the request get handled');
-    expect(plan.exploreRoot).toBe(api);
-    expect(plan.viaSubScan).toBe(true);
-    expect(plan.nudgeProjects).toEqual([]);
-  });
-
-  it('multiple indexed sub-projects, prompt names one by path → front-load it, nudge the rest', () => {
-    mkWorkspaceRoot(tmp);
-    const api = mkIndexed(path.join(tmp, 'packages', 'api'));
-    const web = mkIndexed(path.join(tmp, 'packages', 'web'));
-    const plan = planFrontload(tmp, 'in packages/api, how does the handler validate the token?');
-    expect(plan.exploreRoot).toBe(api);
-    expect(plan.viaSubScan).toBe(true);
-    expect(plan.nudgeProjects).toEqual([web]);
-  });
-
-  it('multiple indexed sub-projects, prompt names one by package name → front-load it', () => {
+  it('unindexed cwd with one indexed sub-project stays silent', () => {
     mkWorkspaceRoot(tmp);
     mkIndexed(path.join(tmp, 'packages', 'api'));
-    const web = mkIndexed(path.join(tmp, 'packages', 'web'));
-    const plan = planFrontload(tmp, 'how does the web frontend render the dashboard?');
-    expect(plan.exploreRoot).toBe(web);
+    const plan = planFrontload(tmp, 'how does the request get handled');
+    expect(plan).toEqual({ exploreRoot: null, nudgeProjects: [], viaSubScan: false });
   });
 
-  it('multiple indexed sub-projects, NO clear match → nudge the full list, do not guess', () => {
+  it('does not select an indexed descendant named by path in the prompt', () => {
     mkWorkspaceRoot(tmp);
-    const api = mkIndexed(path.join(tmp, 'packages', 'api'));
-    const web = mkIndexed(path.join(tmp, 'packages', 'web'));
+    mkIndexed(path.join(tmp, 'packages', 'api'));
+    mkIndexed(path.join(tmp, 'packages', 'web'));
+    const plan = planFrontload(tmp, 'in packages/api, how does the handler validate the token?');
+    expect(plan).toEqual({ exploreRoot: null, nudgeProjects: [], viaSubScan: false });
+  });
+
+  it('does not select an indexed descendant named by package in the prompt', () => {
+    mkWorkspaceRoot(tmp);
+    mkIndexed(path.join(tmp, 'packages', 'api'));
+    mkIndexed(path.join(tmp, 'packages', 'web'));
+    const plan = planFrontload(tmp, 'how does the web frontend render the dashboard?');
+    expect(plan).toEqual({ exploreRoot: null, nudgeProjects: [], viaSubScan: false });
+  });
+
+  it('does not list indexed descendants as an implicit fallback', () => {
+    mkWorkspaceRoot(tmp);
+    mkIndexed(path.join(tmp, 'packages', 'api'));
+    mkIndexed(path.join(tmp, 'packages', 'web'));
     const plan = planFrontload(tmp, 'how does authentication work end to end?');
-    expect(plan.exploreRoot).toBeNull();
-    expect(plan.viaSubScan).toBe(true);
-    expect(plan.nudgeProjects.sort()).toEqual([api, web].sort());
+    expect(plan).toEqual({ exploreRoot: null, nudgeProjects: [], viaSubScan: false });
   });
 
   it('un-indexed dir that is NOT a workspace root → no-op (guards $HOME-style crawls)', () => {
-    // Indexed project exists below, but cwd has no manifest, so the down-scan is skipped.
+    // A descendant's index does not replace the unindexed current directory.
     mkIndexed(path.join(tmp, 'some', 'project'));
     const plan = planFrontload(tmp, 'how does it work');
     expect(plan.exploreRoot).toBeNull();
@@ -144,7 +138,7 @@ describe('planFrontload — front-load hook project resolution (#964)', () => {
     fs.mkdirSync(homeDir, { recursive: true });
     vi.spyOn(os, 'homedir').mockReturnValue(homeDir);
     if (manifest === 'package.json') mkWorkspaceRoot(tmp);
-    else fs.mkdirSync(path.join(tmp, manifest)); // Even a WORKSPACE directory opens the manifest gate.
+    else fs.mkdirSync(path.join(tmp, manifest));
     mkIndexed(path.join(tmp, 'packages', 'api'));
     if (children === 2) mkIndexed(path.join(tmp, 'packages', 'web'));
     expect(unsafeIndexRootReason(tmp)).toBe(root === 'home' ? 'your home directory' : 'a parent of your home directory');

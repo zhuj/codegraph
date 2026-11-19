@@ -7,7 +7,7 @@
  * install git hooks that refresh the index after the operations that change
  * files on disk: commit, merge (covers `git pull`), and checkout.
  *
- * The hooks run `codegraph sync <project root>` in the background so they
+ * The hooks run `codegraph sync <project root> --background --quiet` so they
  * never block git, and are guarded by `command -v codegraph` so they no-op
  * cleanly when the CLI isn't on PATH. Git runs hooks from the top of the work
  * tree, so the block names its project root explicitly — a sub-project's
@@ -129,7 +129,7 @@ function markerBlock(root: string): string {
     '# Managed by codegraph; remove with `codegraph uninit` or delete this block.',
     `${ROOT_PREFIX}${root}`,
     'if command -v codegraph >/dev/null 2>&1; then',
-    `  ( codegraph sync ${shellQuote(root)} >/dev/null 2>&1 & ) >/dev/null 2>&1`,
+    `  ( codegraph sync ${shellQuote(root)} --background --quiet >/dev/null 2>&1 & ) >/dev/null 2>&1`,
     'fi',
     MARKER_END,
   ].join('\n');

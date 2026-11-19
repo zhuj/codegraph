@@ -10,13 +10,13 @@ cd your-project
 codegraph init      # creates .codegraph/ and builds the full graph — one step
 ```
 
-`codegraph init` creates the local `.codegraph/` directory and builds the full graph in the same step — one command, done. There's no separate index step to run afterward, and from here the graph [stays fresh automatically](#stay-fresh-automatically).
+`codegraph init` discovers the nearest `.codegraph/` workspace up to your home directory, or creates one in the current directory if none exists, then builds its graph. It creates an editable `config.yaml` without replacing an existing one. To initialize a separate nested project, pass its path explicitly: `codegraph init .`.
 
 ## Full vs. incremental
 
 ```bash
-codegraph index           # full index of the whole project
-codegraph index --force   # re-index from scratch
+codegraph index           # full index of the configured workspace directories
+codegraph index --force   # also permit an otherwise unsafe broad root
 codegraph sync            # incremental — only changed files
 ```
 
@@ -26,23 +26,21 @@ codegraph sync            # incremental — only changed files
 
 **You don't need to run `codegraph sync` by hand during an agent session.** When your agent (Claude Code, Cursor, Codex, opencode, Hermes, Gemini, Antigravity, Kiro, GitHub Copilot) launches `codegraph serve --mcp`, three layers cooperate to keep the index in step with your code — and to never give the agent a quiet wrong answer in the small window between an edit and the next sync.
 
-### 1. File watcher with debounced auto-sync (always on)
+### 1. File watcher and periodic automatic sync
 
-`serve --mcp` spins up a native file watcher (FSEvents on macOS, inotify on Linux, ReadDirectoryChangesW on Windows) over the project root. Every source-file create / modify / delete is captured. A debounce timer collapses bursts of edits into a single sync.
+When background indexing is enabled, `serve --mcp` starts a native file watcher over the configured directories. File changes are coalesced into automatic syncs, with periodic rescans to recover missing native events. `.codegraph/config.yaml` controls the rate:
 
-```
-agent writes src/Widget.ts
-  → watcher fires (event delivery: typically <100ms)
-  → 2000ms debounce
-  → sync runs; Widget.ts's nodes + edges are in the index
-  → next agent query sees it
+```yaml
+background:
+  enabled: true
+  intervalSeconds: 30
 ```
 
-**Tunable**: `CODEGRAPH_WATCH_DEBOUNCE_MS` overrides the default 2000ms, clamped to `[100ms, 60s]`. Useful when a build step or formatter writes many files in a tight burst — bump it to `5000` or `10000` so the watcher coalesces them into one sync.
+Set `enabled: false` or `intervalSeconds: 0` to disable automatic indexing. Manual `sync` and `index` always run immediately. Existing projects with no YAML background stanza keep the legacy event debounce, configurable through `CODEGRAPH_WATCH_DEBOUNCE_MS` (100–60000ms), and gain periodic rescans. See [Configuration](/codegraph/getting-started/configuration/) for directory selection, exclusions, and live config reload.
 
 ### 2. Per-file staleness banner — covers the debounce window
 
-The watcher debounce introduces a small window (typically 2s) where a freshly-edited file is on disk but not yet in the index. CodeGraph closes that window with a per-file staleness banner: if any MCP tool response would reference a file that's currently pending re-index, the response prepends a `⚠️` banner naming the stale file:
+Between a write and the next configured sync, a file can be newer on disk than in the index. If a tool response references a pending file, it adds a staleness banner:
 
 ```
 ⚠️ Some files referenced below were edited since the last index sync —
@@ -55,13 +53,13 @@ The rest of this response is fresh.
 …
 ```
 
-Agents read this and follow up with a direct `Read` on the named file — validated end-to-end with Claude Code, where the agent literally says "Reading the file directly for the live content" before opening it. So even during the 2-second debounce window, the agent never gets a silent wrong answer.
+Agents can read the named files for current content while waiting for sync; the freshness warning remains separate from the configured background rate.
 
 Pending files **not** referenced by the response surface as a small footer instead (`(Note: N file(s) elsewhere in this project are pending index sync but were not referenced above: …)`). Either way, the signal is explicit.
 
 ### 3. Connect-time catch-up — covers gaps when the MCP server wasn't running
 
-When your editor / agent (re)connects to the MCP server, codegraph runs a fast filesystem-based reconciliation (a `(size, mtime)` stat pre-filter, then a content hash on the rest) before answering the first query. So files changed while no MCP server was running — a `git pull` from the terminal, an edit from another editor, an agent that finished and exited — are caught up automatically on the next session's first tool call.
+When background indexing is enabled, connection-time catch-up reconciles files changed while the server was stopped. Disabling background indexing also disables this automatic catch-up. Request-time freshness checks still identify stale answers, and manual sync remains available immediately.
 
 ### Verify what the watcher sees
 
@@ -81,7 +79,7 @@ If `### Pending sync:` isn't in the response, nothing is in flight.
 
 Almost never. The edge cases:
 
-- **The watcher is disabled.** Sandboxes that block local fs watchers, or you've set `CODEGRAPH_NO_DAEMON=1` to opt out of the shared daemon. In those cases `codegraph sync` is the manual fallback.
+- **Background indexing is disabled.** Use manual sync with `background.enabled: false`, `intervalSeconds: 0`, or `CODEGRAPH_NO_WATCH=1`. `CODEGRAPH_NO_DAEMON=1` selects direct MCP mode and does not by itself disable watching.
 - **Pre-flight before a CI run.** If you're scripting against the index outside an agent session, a single `codegraph sync` at the start of the script guarantees the index reflects the current working tree.
 
 Otherwise: just use it. The watcher + banner + connect-sync covers the AI-assisted workflow end-to-end. If you're seeing files genuinely missed after the debounce window has passed, that's a bug — please file an issue with a reproduction.
@@ -98,4 +96,4 @@ Reports node/edge/file counts, the active SQLite backend, and the journal mode. 
 
 ## What gets indexed
 
-Every file whose extension maps to a [supported language](/codegraph/reference/languages/), minus dependency/build directories excluded by default (`node_modules`, `vendor`, `dist`, …), anything your `.gitignore` excludes, and files over 1 MB. See [Configuration](/codegraph/getting-started/configuration/).
+Supported source files within `directories`, minus explicit `exclude` patterns, dependency/build directories excluded by default (`node_modules`, `vendor`, `dist`, …), anything your `.gitignore` excludes, and files over 1 MB. See [Configuration](/codegraph/getting-started/configuration/).

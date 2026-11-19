@@ -6,6 +6,7 @@ import type CodeGraph from '../index';
 import { canonicalProjectRoot, getCodeGraphDir, isInitialized } from '../directory';
 import { LockUnavailableError } from '../errors';
 import { watchDisabledReason } from '../sync/watch-policy';
+import { hasBackgroundConfig, loadBackgroundConfig } from '../workspace-config';
 import { getDaemonSocketCandidates } from './daemon-paths';
 import { addWatchdogProgressPaths } from './liveness-watchdog';
 import { connectWithHello } from './proxy';
@@ -25,6 +26,8 @@ interface Project {
   options: Parameters<CodeGraph['watch']>[0];
   /** Drops the index files from the liveness watchdog's progress; set while this process writes them (#2404). */
   dropProgress: (() => void) | null;
+  lastActivationMs: number | null;
+  configError: string | null;
 }
 
 export interface ProjectLease {
@@ -47,7 +50,8 @@ export function acquireProject(
   if (!project) {
     const cg = open();
     project = { key, cg, refs: 0, owner: false, caughtUp: false, retirement: null, gate: null, socket: null, options,
-      dropProgress: null, timer: setInterval(() => { void ready(root, project!); }, 1000) };
+      dropProgress: null, lastActivationMs: null, configError: null,
+      timer: setInterval(() => { void ready(root, project!, true); }, 1000) };
     project.timer.unref();
     projects.set(key, project);
   }
@@ -79,7 +83,7 @@ function retire(root: string, project: Project): Promise<void> {
   const finish = (): void => {
     if (project.refs > 0) {
       project.retirement = null;
-      project.timer = setInterval(() => { void ready(root, project); }, 1000);
+      project.timer = setInterval(() => { void ready(root, project, true); }, 1000);
       project.timer.unref();
       resolve();
       return;
@@ -100,11 +104,55 @@ function retire(root: string, project: Project): Promise<void> {
   return retirement;
 }
 
-function ready(root: string, project: Project): Promise<void> {
+function ready(root: string, project: Project, backgroundTick = false): Promise<void> {
   if (project.gate) return project.gate;
+  // Config polling is cheap (mtime-cached), but a retry must not turn into a
+  // filesystem scan more often than the user's background rate. Disabled
+  // projects remain queryable and can still be synced explicitly by the CLI.
+  let background: ReturnType<typeof loadBackgroundConfig>;
+  try {
+    background = loadBackgroundConfig(root);
+    project.configError = null;
+  } catch (error) {
+    project.cg.unwatch();
+    project.caughtUp = false;
+    project.lastActivationMs = null;
+    const message = error instanceof Error ? error.message : String(error);
+    if (message !== project.configError) {
+      process.stderr.write(`[CodeGraph MCP] Background sync disabled: ${message}\n`);
+      project.configError = message;
+    }
+    return Promise.resolve();
+  }
+  if (!background.enabled || background.intervalSeconds === 0) {
+    project.cg.unwatch();
+    project.caughtUp = false;
+    project.lastActivationMs = null;
+    project.socket?.destroy();
+    project.socket = null;
+    if (project.owner && !project.cg.isIndexing()) {
+      releaseWriterLock(root);
+      project.owner = false;
+      project.dropProgress?.();
+      project.dropProgress = null;
+    }
+    return Promise.resolve();
+  }
+  // The file watcher can see a disable/invalid edit and stop before this
+  // lifecycle's next poll. If the user fixes it quickly, we never observe the
+  // intermediate config here; its explicit pause flag still requires re-arm.
+  if (project.cg.isWatcherPausedByConfig()) {
+    project.caughtUp = false;
+    project.lastActivationMs = null;
+  }
   if (project.refs === 0 || (project.owner && project.caughtUp) || (project.socket && !project.socket.destroyed)) {
     return Promise.resolve();
   }
+  if (backgroundTick && hasBackgroundConfig(root) && project.lastActivationMs !== null &&
+      Date.now() - project.lastActivationMs < background.intervalSeconds * 1000) {
+    return Promise.resolve();
+  }
+  project.lastActivationMs = Date.now();
   const gate = activate(root, project).catch((err) => {
     // A CLI/indexer can hold codegraph.lock even while we own writer.pid.
     // Leave caughtUp false so the next access or timer retries quietly (#1361).
