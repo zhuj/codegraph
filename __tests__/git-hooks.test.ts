@@ -240,6 +240,23 @@ describe('git sync hooks — project roots and existing hooks', () => {
     expect(body.split('# >>> codegraph sync hook >>>').length - 1).toBe(1);
   });
 
+  it.runIf(process.platform === 'win32')('matches an existing root across Windows case and namespace spellings', () => {
+    installGitSyncHook(repo, ['post-commit']);
+    const original = fs.readFileSync(hookFile(), 'utf8');
+    // Earlier versions recorded the caller's spelling, so a changed case in
+    // an existing marker must not create a second block or prevent removal.
+    const alternate = path.toNamespacedPath(repo.toUpperCase());
+    fs.writeFileSync(hookFile(), original.replace(/^# codegraph-root: .*$/m,
+      `# codegraph-root: ${alternate.split(path.sep).join('/')}`));
+
+    expect(isSyncHookInstalled(repo, ['post-commit'])).toBe(true);
+    expect(isSyncHookInstalled(repo.toUpperCase(), ['post-commit'])).toBe(true);
+    installGitSyncHook(repo, ['post-commit']);
+    expect(fs.readFileSync(hookFile(), 'utf8').split('# >>> codegraph sync hook >>>').length - 1).toBe(1);
+    expect(removeGitSyncHook(repo.toLowerCase(), ['post-commit']).installed).toEqual(['post-commit']);
+    expect(fs.existsSync(hookFile())).toBe(false);
+  });
+
   it('leaves a hook written in another language untouched', () => {
     const python = '#!/usr/bin/env python3\nprint("my hook")\n';
     fs.writeFileSync(hookFile(), python, { mode: 0o755 });

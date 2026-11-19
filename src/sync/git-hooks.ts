@@ -100,8 +100,24 @@ function rootKey(projectRoot: string): string {
   return resolved.split(path.sep).join('/');
 }
 
-/** The work tree's top level (as a {@link rootKey}), or null when unknown. */
-function gitToplevelKey(projectRoot: string): string | null {
+/**
+ * Identity only; keep {@link rootKey}'s spelling for the generated shell command.
+ * Git and Node can name one Windows folder with different case or 8.3 names.
+ * Non-native realpath preserves those spellings; native realpath asks the
+ * filesystem for its full name. Normalize the optional Windows namespace too.
+ */
+function rootIdentity(projectRoot: string): string {
+  let resolved = path.resolve(projectRoot);
+  try {
+    resolved = fs.realpathSync.native(resolved);
+  } catch {
+    /* retain lexical identity when the recorded root no longer exists */
+  }
+  return process.platform === 'win32' ? path.toNamespacedPath(resolved).toLowerCase() : resolved;
+}
+
+/** The work tree's top-level identity, or null when unknown. */
+function gitToplevelIdentity(projectRoot: string): string | null {
   try {
     const out = execFileSync('git', ['rev-parse', '--show-toplevel'], {
       cwd: projectRoot,
@@ -110,7 +126,7 @@ function gitToplevelKey(projectRoot: string): string | null {
       windowsHide: true,
       timeout: 5000, // same rationale as isGitRepo
     }).trim();
-    return out ? rootKey(out) : null;
+    return out ? rootIdentity(out) : null;
   } catch {
     return null;
   }
@@ -144,11 +160,11 @@ type BlockOwner = (blockRoot: string | null) => boolean;
  * directory git runs hooks in.
  */
 function ownerFor(projectRoot: string): BlockOwner {
-  const root = rootKey(projectRoot);
+  const root = rootIdentity(projectRoot);
   let toplevel: string | null | undefined;
   return (blockRoot) => {
-    if (blockRoot !== null) return blockRoot === root;
-    if (toplevel === undefined) toplevel = gitToplevelKey(projectRoot);
+    if (blockRoot !== null) return rootIdentity(blockRoot) === root;
+    if (toplevel === undefined) toplevel = gitToplevelIdentity(projectRoot);
     return toplevel === root;
   };
 }

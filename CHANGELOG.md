@@ -28,6 +28,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Per-user data in `~/.codegraph` no longer redirects project initialization to your home directory.
 - TypeScript type-only star re-exports no longer trigger false parse warnings, and type references resolve through these barrel files.
 - Type-export preprocessing preserves matching examples inside templates, comments, regular expressions, and JSX text, keeping stored signatures and documentation intact.
+- Git sync hooks recognize their project through Windows path aliases, including hooks created by an older installation.
 
 ### Security
 
