@@ -191,7 +191,7 @@ describe('nearest .codegraph workspace discovery', () => {
     const fresh = CodeGraph.initSync(workspace);
     fresh.close();
     const file = path.join(getCodeGraphDir(workspace), 'config.yaml');
-    expect(fs.readFileSync(file, 'utf8')).toContain('intervalSeconds: 30');
+    expect(fs.readFileSync(file, 'utf8')).toContain('intervalSeconds: 600');
     const custom = 'directories: [b/c]\nbackground: { enabled: false }\n';
     fs.writeFileSync(file, custom);
     const opened = CodeGraph.openSync(workspace);

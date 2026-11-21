@@ -134,7 +134,7 @@ codegraph init
 
 ### 4. No more syncing!
 
-Background sync is enabled by default. CodeGraph watches the selected scan directories and coalesces changes at the interval in `.codegraph/config.yaml` (30 seconds by default); periodic rescans also recover missed file events. Run `codegraph sync` to apply changes immediately.
+Background sync is enabled by default. CodeGraph watches the selected scan directories and coalesces changes at the interval in `.codegraph/config.yaml` (600 seconds by default); periodic rescans also recover missed file events. Run `codegraph sync` to apply changes immediately.
 
 ### Uninstall
 
@@ -543,6 +543,7 @@ codegraph uninstall               # Remove CodeGraph from your agents AND the CL
 codegraph init [path]             # Initialize a project + build its graph (one step; --local-only keeps .codegraph/ out of git)
 codegraph uninit [path]           # Remove CodeGraph from a project (--force to skip prompt)
 codegraph index [path]            # Rebuild the full index from scratch (--quiet for less output; --force to allow a home folder or drive root)
+codegraph index --resume [path]   # Recover a compatible interrupted index without discarding committed work
 codegraph sync [path]             # Incremental update
 codegraph status [path]           # Show statistics (--json, --strict)
 codegraph unlock [path]           # Remove a stale lock file that's blocking indexing
@@ -729,7 +730,7 @@ exclude:
 
 background:
   enabled: true
-  intervalSeconds: 30
+  intervalSeconds: 600
 ```
 
 `directories` limits full indexing, incremental sync, and background scans to
@@ -741,8 +742,9 @@ the index on the next sync. A workspace at your home directory must explicitly
 list subdirectories; scanning the entire home still requires `--force`.
 
 `background.intervalSeconds` controls automatic rescans and batches of file
-changes while the MCP server is running. The default is 30 seconds; fractional
-seconds are supported. Set `enabled: false` or `intervalSeconds: 0` to turn off
+changes while the MCP server is running. The default is 600 seconds (10 minutes);
+existing explicit intervals are preserved. Fractional seconds are supported.
+Set `enabled: false` or `intervalSeconds: 0` to turn off
 automatic indexing. Explicit `codegraph sync` and `codegraph index` commands run
 immediately regardless of that setting. Configuration edits are reloaded by the
 running watcher; a periodic scan also recovers changes missed by native events.
@@ -1028,6 +1030,8 @@ Framework routing is validated the same way, on a canonical app per framework: E
 ## Troubleshooting
 
 **"CodeGraph not initialized"** — Run `codegraph init` in your project directory first.
+
+**Indexing was interrupted**: Run `codegraph index --resume` to reuse committed file results and recover pending graph work from a compatible interrupted run. It still scans the checkout to verify current files and does not resume at the exact scan position. If the interrupted run is incompatible, use the original compatible engine or start a new build with `codegraph index`.
 
 **Answers still look like the old version after an upgrade** — Re-index each project with `codegraph index`. Most fixes take effect when a file is indexed, so an index an older version built keeps its old links until then. `codegraph status` says when a project's index was built by an older version, and your agent's first answer in that project warns you once.
 

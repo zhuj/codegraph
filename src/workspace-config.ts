@@ -22,7 +22,7 @@ export interface WorkspaceConfig {
 }
 
 const DEFAULT_DIRECTORIES = Object.freeze(['.']) as unknown as string[];
-const DEFAULT_BACKGROUND: BackgroundConfig = Object.freeze({ enabled: true, intervalSeconds: 30 });
+const DEFAULT_BACKGROUND: BackgroundConfig = Object.freeze({ enabled: true, intervalSeconds: 600 });
 const MAX_CONFIG_BYTES = 1024 * 1024;
 const MAX_INTERVAL_SECONDS = Math.floor(0x7fffffff / 1000);
 const KEYS = new Set(['directories', 'exclude', 'include', 'includeIgnored', 'deprioritize', 'extensions', 'background']);
@@ -189,7 +189,7 @@ directories:
 # Set enabled: false or intervalSeconds: 0 to disable background work.
 background:
   enabled: true
-  intervalSeconds: 30
+  intervalSeconds: ${DEFAULT_BACKGROUND.intervalSeconds}
 `;
   try { fs.writeFileSync(file, contents, { flag: 'wx', mode: 0o600 }); }
   catch (error) {

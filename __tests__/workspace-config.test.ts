@@ -41,16 +41,24 @@ describe('workspace YAML configuration', () => {
   it('keeps defaults when absent and writes an editable template only once', () => {
     expect(loadScanDirectories(root)).toEqual(['.']);
     expect(hasExplicitScanDirectories(root)).toBe(false);
-    expect(loadBackgroundConfig(root)).toEqual({ enabled: true, intervalSeconds: 30 });
+    expect(loadBackgroundConfig(root)).toEqual({ enabled: true, intervalSeconds: 600 });
     expect(hasBackgroundConfig(root)).toBe(false);
     expect(ensureWorkspaceConfig(root)).toBe(true);
     expect(hasBackgroundConfig(root)).toBe(true);
+    expect(fs.readFileSync(getWorkspaceConfigPath(root), 'utf8')).toContain('intervalSeconds: 600');
     config('directories: [a/b]\nbackground: { enabled: false, intervalSeconds: 120 }\n');
     const original = fs.readFileSync(getWorkspaceConfigPath(root), 'utf8');
     expect(ensureWorkspaceConfig(root)).toBe(false);
     expect(fs.readFileSync(getWorkspaceConfigPath(root), 'utf8')).toBe(original);
     expect(loadScanDirectories(root)).toEqual(['a/b']);
     expect(loadBackgroundConfig(root)).toEqual({ enabled: false, intervalSeconds: 120 });
+  });
+
+  it('inherits 600 seconds only when no interval is configured', () => {
+    config('background: { enabled: true }\n');
+    expect(loadBackgroundConfig(root)).toEqual({ enabled: true, intervalSeconds: 600 });
+    config('background: { enabled: true, intervalSeconds: 30 }\n');
+    expect(loadBackgroundConfig(root)).toEqual({ enabled: true, intervalSeconds: 30 });
   });
 
   it('preserves legacy settings unless the YAML explicitly overrides that field', () => {

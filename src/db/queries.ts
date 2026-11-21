@@ -492,6 +492,9 @@ export class QueryBuilder {
     deleteFile?: SqliteStatement;
     getFileByPath?: SqliteStatement;
     getAllFiles?: SqliteStatement;
+    getFirstFilesPage?: SqliteStatement;
+    getFilesPageAfter?: SqliteStatement;
+    advanceFileModifiedAt?: SqliteStatement;
     hasFilesUnder?: SqliteStatement;
     insertUnresolved?: SqliteStatement;
     deleteUnresolvedByNode?: SqliteStatement;
@@ -4280,6 +4283,27 @@ export class QueryBuilder {
     }
     const rows = this.stmts.getAllFiles.all() as FileRow[];
     return rows.map(rowToFileRecord);
+  }
+
+  /** Keyset page in inventory order, fully read before returning to the caller. */
+  getFilesPage(after: string | null, limit: number): FileRecord[] {
+    if (after === null) {
+      this.stmts.getFirstFilesPage ??= this.db.prepare('SELECT * FROM files ORDER BY path LIMIT ?');
+      return (this.stmts.getFirstFilesPage.all(limit) as FileRow[]).map(rowToFileRecord);
+    }
+    this.stmts.getFilesPageAfter ??= this.db.prepare('SELECT * FROM files WHERE path > ? ORDER BY path LIMIT ?');
+    return (this.stmts.getFilesPageAfter.all(after, limit) as FileRow[]).map(rowToFileRecord);
+  }
+
+  /** Advance a validated same-content stamp without replacing the indexed row. */
+  advanceFileModifiedAt(previous: FileRecord, modifiedAt: number): void {
+    this.stmts.advanceFileModifiedAt ??= this.db.prepare(`
+      UPDATE files SET modified_at = ?
+      WHERE path = ? AND content_hash = ? AND size = ? AND modified_at = ? AND indexed_at = ?
+    `);
+    this.stmts.advanceFileModifiedAt.run(
+      modifiedAt, previous.path, previous.contentHash, previous.size, previous.modifiedAt, previous.indexedAt,
+    );
   }
 
   /**

@@ -33,7 +33,7 @@ When background indexing is enabled, `serve --mcp` starts a native file watcher 
 ```yaml
 background:
   enabled: true
-  intervalSeconds: 30
+  intervalSeconds: 600
 ```
 
 Set `enabled: false` or `intervalSeconds: 0` to disable automatic indexing. Manual `sync` and `index` always run immediately. Existing projects with no YAML background stanza keep the legacy event debounce, configurable through `CODEGRAPH_WATCH_DEBOUNCE_MS` (100–60000ms), and gain periodic rescans. See [Configuration](/codegraph/getting-started/configuration/) for directory selection, exclusions, and live config reload.

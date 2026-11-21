@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- Release bundles now include Node.js 24.22.3 with the November security fixes.
+
 ### New Features
 
 - Animated indexing and sync progress shows the current directory in brackets without redrawing for every file or directory change.
@@ -20,9 +24,13 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Configure multiple scan directories, exclusions, and the background sync interval in `.codegraph/config.yaml`, with immediate manual `index` and `sync` commands.
 - Commands discover the nearest `.codegraph` directory or symlink below your home directory, including a workspace whose index has not been built yet.
 - Background rescans recover missed file events and reload workspace settings without restarting the server.
+- The default background sync interval is now 10 minutes to reduce repeated scans of large workspaces without changing your explicit settings.
+- Recover an interrupted build with `codegraph index --resume` without discarding compatible work already saved to the index.
 
 ### Fixes
 
+- Sync keeps indexed results when it cannot verify a source file or directory because of a filesystem error.
+- Sync reads stored file metadata in small batches and avoids reopening files whose timestamps changed without a content change.
 - Animated progress refreshes paths, counts, and phases only when its animation advances, keeping terminal output calm during fast scanning and indexing.
 - When no project `.codegraph` is found below your home directory, CLI commands, MCP startup, and prompt hooks use the current directory without automatically selecting an indexed child project.
 - Per-user data in `~/.codegraph` no longer redirects project initialization to your home directory.

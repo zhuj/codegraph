@@ -22,7 +22,7 @@ exclude:
   - "**/generated/**"
 background:
   enabled: true
-  intervalSeconds: 30
+  intervalSeconds: 600
 ```
 
 Paths are relative to the folder **containing** `.codegraph`, even when that directory is a symlink to storage elsewhere. They are directory names, not glob patterns; absolute paths and `..` are rejected. Omitting `directories` selects the entire workspace (`[.]`); `directories: []` selects nothing. Overlapping entries are deduplicated. Full index, incremental sync, and the file watcher share this scope, and the next sync removes files that no longer belong to it. A home-level workspace must explicitly select subdirectories to run without `--force`.
@@ -31,13 +31,13 @@ Exclusions use gitignore-style patterns. They win over inclusion settings and ex
 
 ## Background sync rate
 
-`background.intervalSeconds` defaults to 30 seconds and supports fractional seconds. It controls automatic rescans and the rate of automatic file-change batches while the MCP server runs. Only changed files are reparsed; a timer does not rebuild the entire database each time. Native events are coalesced, and periodic rescans recover events the operating system missed. Syncs do not overlap.
+`background.intervalSeconds` defaults to 600 seconds (10 minutes) and supports fractional seconds. It controls automatic rescans and the rate of automatic file-change batches while the MCP server runs. Only changed files are reparsed; a timer does not rebuild the entire database each time. Native events are coalesced, and periodic rescans recover events the operating system missed. Syncs do not overlap.
 
 Set `background.enabled: false` or `background.intervalSeconds: 0` to disable automatic indexing, including connect-time catch-up. Manual `codegraph sync` and `codegraph index` run immediately. The running watcher reloads config changes, including when the data directory is a symlink. Invalid YAML, unknown settings, and invalid directory paths fail with an error instead of falling back to a broader scan.
 
 These background rescans supplement an active watcher; existing platform restrictions (such as WSL Windows-drive watch suppression) and `CODEGRAPH_NO_WATCH=1` still apply. Disabling background work stops new automatic syncs and lets an in-flight transaction finish. Managed Git sync hooks also honor the configured rate and disabled state; reinstall existing hooks to update their managed command.
 
-Existing projects without a YAML background stanza keep the legacy event debounce until it is configured. New workspace templates explicitly use 30 seconds. Existing user configuration is never overwritten when the template is created.
+Existing projects without a YAML background stanza keep the legacy event debounce until it is configured. New workspace templates explicitly use 600 seconds. Existing user configuration, including explicit intervals, is never overwritten when the template is created.
 
 ## Offline defaults
 

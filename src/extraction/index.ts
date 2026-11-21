@@ -38,7 +38,7 @@ import { createYielder, type MaybeYield } from '../resolution/cooperative-yield'
 import { resurrectRefFromDroppedEdge } from '../resolution/resurrect-ref';
 import { createImportReader, reopenReferencesThroughRemovedFiles } from '../resolution/module-importers';
 import { manifestEvidence, type ManifestEvidence } from '../resolution/workspace-packages';
-import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
+import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync, type BoundedSource } from '../file-limits';
 export { oversizeStamp };
 
 /**
@@ -58,6 +58,8 @@ const FILE_IO_BATCH_SIZE = 10;
  * concurrent read query responsive while the reconcile runs.
  */
 const SYNC_RECONCILE_YIELD_INTERVAL = 1000;
+const FILE_INVENTORY_PAGE_SIZE = 256;
+const FULL_SYNC_STAT_CONCURRENCY = 8;
 
 // PARSER_RESET_INTERVAL moved to parse-worker.ts (runs in worker thread)
 
@@ -215,10 +217,93 @@ export function hashContent(content: string): string {
  * and runs only for a file that is new or changed — never once per `.ts` file
  * at discovery, which on a slow disk is a random read per file per scan.
  */
-function readSourceOrStamp(fullPath: string): string | null {
-  const { stats, bytes } = readBoundedSourceSync(fullPath);
+function sourceOrStamp(fullPath: string, { stats, bytes }: BoundedSource): string | null {
   if (bytes === null) return oversizeStamp(stats.size);
   return isMpegTsBytes(fullPath, bytes) ? null : bytes.toString('utf8');
+}
+
+function readSourceOrStamp(fullPath: string): string | null {
+  return sourceOrStamp(fullPath, readBoundedSourceSync(fullPath));
+}
+
+function stableTouch(previous: FileRecord, observed: fs.Stats, { stats, bytes }: BoundedSource): boolean {
+  // The ending descriptor stat must describe what reconciliation saw, not a
+  // later edit or replacement. A size-only stamp is not evidence of equal bytes.
+  return bytes !== null && bytes.length === stats.size && stats.size === previous.size &&
+    observed.size === stats.size && observed.mtimeMs === stats.mtimeMs && observed.ctimeMs === stats.ctimeMs &&
+    observed.dev === stats.dev && observed.ino === stats.ino && previous.modifiedAt !== stats.mtimeMs;
+}
+
+function needsZeroNodeRepair(file: FileRecord): boolean {
+  // Error rows are deliberate skips (#1557), not the wiped, error-free
+  // rows (#1541) that would otherwise pass the size/mtime and hash checks.
+  return file.nodeCount === 0 && !isFileLevelOnlyLanguage(file.language) && !file.errors?.length;
+}
+
+type SyncPathObservation =
+  | { kind: 'file'; stat: fs.Stats }
+  | { kind: 'absent' }
+  | { kind: 'unknown'; error: unknown };
+
+type TrackedPathCheck<Probe> =
+  | { kind: 'wipe' | 'excluded' | 'uncovered' }
+  | { kind: 'probe'; listed: boolean; probe: Probe };
+
+function syncPathFromStat(stat: fs.Stats): SyncPathObservation {
+  return stat.isFile() ? { kind: 'file', stat } : { kind: 'absent' };
+}
+
+function syncPathStatError(error: unknown): SyncPathObservation {
+  return isMissingPathError(error) ? { kind: 'absent' } : { kind: 'unknown', error };
+}
+
+function observeSyncPath(fullPath: string): SyncPathObservation {
+  try {
+    return syncPathFromStat(fs.statSync(fullPath));
+  } catch (error) {
+    return syncPathStatError(error);
+  }
+}
+
+async function observeSyncPathAsync(fullPath: string): Promise<SyncPathObservation> {
+  try {
+    return syncPathFromStat(await fsp.stat(fullPath));
+  } catch (error) {
+    return syncPathStatError(error);
+  }
+}
+
+/** Local identity for one sync, not a persistent mount fingerprint. */
+function syncRootIdentity(rootDir: string): string {
+  let stat: fs.BigIntStats;
+  try {
+    stat = fs.statSync(rootDir, { bigint: true });
+  } catch (error) {
+    throw new Error('Cannot verify the source root during sync', { cause: error });
+  }
+  if (!stat.isDirectory()) throw new Error('The source root is not a directory');
+  return `${stat.dev}:${stat.ino}`;
+}
+
+/** An observed discovery error at a logical project path, not proof of absence. */
+type DiscoveryFailure = { readonly relativePath: string; readonly error: unknown };
+type OnDiscoveryFailure = (failure: DiscoveryFailure) => void;
+
+function discoveryFailureReporter(rootDir: string, onFailure?: OnDiscoveryFailure) {
+  return (fullPath: string, error: unknown): void => {
+    if (!onFailure || isMissingPathError(error)) return;
+    const relativePath = normalizePath(path.relative(rootDir, fullPath)) || '.';
+    if (!escapesRoot(relativePath)) onFailure({ relativePath, error });
+  };
+}
+
+function failedDiscoveryCovers(failures: ReadonlySet<string>, filePath: string): boolean {
+  if (failures.size === 0) return false;
+  if (failures.has('.') || failures.has(filePath)) return true;
+  for (let slash = filePath.lastIndexOf('/'); slash > 0; slash = filePath.lastIndexOf('/', slash - 1)) {
+    if (failures.has(filePath.slice(0, slash))) return true;
+  }
+  return false;
 }
 
 /**
@@ -776,15 +861,16 @@ function includeStaticRoots(patterns: string[]): string[] {
  */
 function collectIncludedFiles(
   rootDir: string,
-  include: Ignore,
-  exclude: Ignore | null,
-  roots: string[],
-  overrides: Record<string, Language>,
+  { include, exclude, roots, overrides }: {
+    include: Ignore; exclude: Ignore | null; roots: string[]; overrides: Record<string, Language>;
+  },
+  onDiscoveryFailure?: OnDiscoveryFailure,
 ): Set<string> {
   const out = new Set<string>();
   const defaults = defaultsOnlyIgnore();
   const visited = new Set<string>();
   const selected = loadScanDirectories(rootDir);
+  const reportFailure = discoveryFailureReporter(rootDir, onDiscoveryFailure);
 
   const consider = (abs: string, rel: string, isDir: boolean): void => {
     if (!matchesScanDirectories(rel, selected, isDir)) return;
@@ -809,7 +895,8 @@ function collectIncludedFiles(
     let realDir: string;
     try {
       realDir = fs.realpathSync(absDir);
-    } catch {
+    } catch (error) {
+      reportFailure(absDir, error);
       return;
     }
     if (visited.has(realDir)) return; // symlink-cycle guard
@@ -818,7 +905,8 @@ function collectIncludedFiles(
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(absDir, { withFileTypes: true });
-    } catch {
+    } catch (error) {
+      reportFailure(absDir, error);
       return;
     }
     for (const entry of entries) {
@@ -830,8 +918,8 @@ function collectIncludedFiles(
         try {
           const st = fs.statSync(fs.realpathSync(abs));
           consider(abs, rel, st.isDirectory());
-        } catch {
-          // broken symlink — skip
+        } catch (error) {
+          reportFailure(abs, error);
         }
         continue;
       }
@@ -852,11 +940,13 @@ function collectIncludedFiles(
  * roots, exclude, and overrides so both enumeration paths (git and filesystem
  * walk) add the same files.
  */
-function collectIncludedFilesForRoot(rootDir: string): Set<string> {
+function collectIncludedFilesForRoot(rootDir: string, onDiscoveryFailure?: OnDiscoveryFailure): Set<string> {
   const include = loadIncludeMatcher(rootDir);
   if (!include) return new Set();
   const roots = includeStaticRoots(loadIncludePatterns(rootDir));
-  return collectIncludedFiles(rootDir, include, loadExcludeMatcher(rootDir), roots, loadExtensionOverrides(rootDir));
+  return collectIncludedFiles(rootDir, {
+    include, roots, exclude: loadExcludeMatcher(rootDir), overrides: loadExtensionOverrides(rootDir),
+  }, onDiscoveryFailure);
 }
 
 /**
@@ -1558,7 +1648,11 @@ function gitRepoPrefix(dir: string): string {
  * embedded (nested, non-submodule) git repos. Returns null on failure
  * (non-git project) so callers can fall back to a filesystem walk.
  */
-function getGitVisibleFiles(rootDir: string, onManifestEvidence?: (evidence: ManifestEvidence) => void): Set<string> | null {
+function getGitVisibleFiles(
+  rootDir: string,
+  onManifestEvidence?: (evidence: ManifestEvidence) => void,
+  onDiscoveryFailure?: OnDiscoveryFailure,
+): Set<string> | null {
   reportCurrentDirectory(rootDir);
   try {
     // Check if the project directory is gitignored by a parent repo.
@@ -1608,7 +1702,7 @@ function getGitVisibleFiles(rootDir: string, onManifestEvidence?: (evidence: Man
     // listed them above — discover them directly off disk and add them. (The
     // common SVN+Git dual-VCS case: source committed to SVN, gitignored out of
     // Git, but still wanted in the graph.)
-    for (const f of collectIncludedFilesForRoot(rootDir)) visible.add(f);
+    for (const f of collectIncludedFilesForRoot(rootDir, onDiscoveryFailure)) visible.add(f);
     return visible;
   } catch (error) {
     // Any failure here (git missing, a `git rev-parse`/`ls-files` timeout or
@@ -1939,12 +2033,14 @@ export async function scanDirectoryAsync(
   onProgress?: (current: number, file: string) => void,
   stats?: ScanSkipStats,
   /** Given what git's listings say about the package manifests (git repositories only; see ManifestEvidence). */
-  onManifestEvidence?: (evidence: ManifestEvidence) => void
+  onManifestEvidence?: (evidence: ManifestEvidence) => void,
+  /** Observed filesystem discovery failures; silence does not certify complete enumeration. */
+  onDiscoveryFailure?: OnDiscoveryFailure
 ): Promise<string[]> {
   // Custom extension → language overrides from the project's codegraph.json.
   const overrides = loadExtensionOverrides(rootDir);
 
-  const gitFiles = getGitVisibleFiles(rootDir, onManifestEvidence);
+  const gitFiles = getGitVisibleFiles(rootDir, onManifestEvidence, onDiscoveryFailure);
   if (gitFiles) {
     const files: string[] = [];
     let count = 0;
@@ -1965,7 +2061,7 @@ export async function scanDirectoryAsync(
     return files;
   }
 
-  return scanDirectoryWalk(rootDir, onProgress, stats);
+  return scanDirectoryWalk(rootDir, onProgress, stats, onDiscoveryFailure);
 }
 
 /**
@@ -1974,12 +2070,14 @@ export async function scanDirectoryAsync(
 function scanDirectoryWalk(
   rootDir: string,
   onProgress?: (current: number, file: string) => void,
-  stats?: ScanSkipStats
+  stats?: ScanSkipStats,
+  onDiscoveryFailure?: OnDiscoveryFailure
 ): string[] {
   const files: string[] = [];
   let count = 0;
   const visitedDirs = new Set<string>();
   const selected = loadScanDirectories(rootDir);
+  const reportFailure = discoveryFailureReporter(rootDir, onDiscoveryFailure);
   // Custom extension → language overrides from the project's codegraph.json.
   const overrides = loadExtensionOverrides(rootDir);
 
@@ -2018,8 +2116,9 @@ function scanDirectoryWalk(
     let realDir: string;
     try {
       realDir = fs.realpathSync(dir);
-    } catch {
+    } catch (error) {
       logDebug('Skipping unresolvable directory', { dir });
+      reportFailure(dir, error);
       return;
     }
 
@@ -2040,6 +2139,7 @@ function scanDirectoryWalk(
       entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch (error) {
       logDebug('Skipping unreadable directory', { dir, error: String(error) });
+      reportFailure(dir, error);
       return;
     }
 
@@ -2071,8 +2171,9 @@ function scanDirectoryWalk(
               }
             }
           }
-        } catch {
+        } catch (error) {
           logDebug('Skipping broken symlink', { path: fullPath });
+          reportFailure(fullPath, error);
         }
         continue;
       }
@@ -2108,7 +2209,7 @@ function scanDirectoryWalk(
   // Force-include first-party source whitelisted in `codegraph.json` `include`
   // — the walk above honours `.gitignore`, so anything gitignored was dropped;
   // add it back here (deduped). Mirrors the git path's union.
-  const included = collectIncludedFilesForRoot(rootDir);
+  const included = collectIncludedFilesForRoot(rootDir, onDiscoveryFailure);
   if (included.size > 0) {
     const seen = new Set(files);
     for (const f of included) {
@@ -3437,18 +3538,23 @@ export class ExtractionOrchestrator {
    * row cascades nothing: it has no nodes, so no edges or refs either.
    */
   private healZeroNodeRows(): void {
-    for (const f of this.queries.getAllFiles()) {
-      // A zero-node row WITH recorded errors is a deliberate skip marker
-      // (#1557: oversized / repeatedly-unparseable files are persisted with
-      // their reason so syncs stop retrying them) — leave those alone. The
-      // #1541 wipe rows are the error-FREE zero-node rows.
-      if (
-        f.nodeCount === 0 &&
-        !isFileLevelOnlyLanguage(f.language) &&
-        (f.errors === undefined || f.errors.length === 0)
-      ) {
-        this.queries.deleteFile(f.path);
+    for (const page of this.fileInventoryPages()) {
+      for (const f of page) {
+        if (needsZeroNodeRepair(f)) this.queries.deleteFile(f.path);
       }
+    }
+  }
+
+  /** Only a materialized page, never a SQLite cursor, can cross a sync yield. */
+  private *fileInventoryPages(): Iterable<readonly FileRecord[]> {
+    let after: string | null = null;
+    for (;;) {
+      const page = this.queries.getFilesPage(after, FILE_INVENTORY_PAGE_SIZE);
+      const last = page.at(-1);
+      if (!last) return;
+      yield page;
+      if (page.length < FILE_INVENTORY_PAGE_SIZE) return;
+      after = last.path;
     }
   }
 
@@ -3944,6 +4050,12 @@ export class ExtractionOrchestrator {
   ): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     const startTime = Date.now();
+    const rootIdentity = syncRootIdentity(this.rootDir);
+    const assertSameRoot = () => {
+      if (syncRootIdentity(this.rootDir) !== rootIdentity) {
+        throw new Error('The source root changed during sync');
+      }
+    };
     const scopeFingerprint = this.scopeFingerprint();
     const indexedScope = this.queries.getMetadata('indexed_scope_config');
     if (indexedScope !== scopeFingerprint) {
@@ -3989,37 +4101,31 @@ export class ExtractionOrchestrator {
     // changes from `git pull`/`checkout`/`merge`/`rebase` — which `git status`
     // cannot see, because the working tree is clean afterward.
     const tSyncScan = Date.now();
+    const isScoped = scopedPaths !== undefined && scopedPaths.length > 0;
+    const failedDiscoveryPaths = new Set<string>();
     let currentFiles: string[];
-    let trackedFiles: FileRecord[];
-    if (scopedPaths && scopedPaths.length > 0) {
+    let inventory: Iterable<readonly FileRecord[]>;
+    if (isScoped) {
       // Scoped reconcile: stat only the reported paths. filesChecked counts
       // the PATHS examined (not the files found) — it must stay non-zero even
       // when every scoped path was a deletion, because CodeGraph.watch()
       // reads `filesChecked === 0 && durationMs === 0` as the
       // lock-unavailable signature (#449).
       const unique = [...new Set(scopedPaths)];
-      // A scoped path is "present" only if it exists AND is in scope — the
-      // same two gates the full walk applies (source extension, scope
-      // matcher). Without the scope gate a caller's stale view of scope
-      // leaked straight into the index: the watcher re-parsed a file the
-      // user had just excluded in `codegraph.json` while `codegraph sync`
-      // removed it (#1590). Out-of-scope paths fall out of `currentFiles`,
-      // so a tracked one takes the removal branch below, exactly as a full
-      // sync would treat it. (`include`-forced paths pass: ScopeIgnore
-      // applies the include precedence itself.)
+      // Scope is independent of disk presence. A caller's stale view must not
+      // re-index a path the user excluded (#1590); ScopeIgnore also applies
+      // include precedence. Observe the resulting candidates below.
       const scope = this.scopedSyncMatcher();
       const overrides = loadExtensionOverrides(this.rootDir);
       currentFiles = unique.filter(
-        (p) =>
-          isSourceFile(p, overrides, this.rootDir) &&
-          !scope.ignores(p) &&
-          fs.existsSync(path.join(this.rootDir, p))
+        (p) => isSourceFile(p, overrides, this.rootDir) && !scope.ignores(p)
       );
-      trackedFiles = [];
+      const trackedFiles: FileRecord[] = [];
       for (const p of unique) {
         const rec = this.queries.getFileByPath(p);
         if (rec) trackedFiles.push(rec);
       }
+      inventory = [trackedFiles];
       filesChecked = unique.length;
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scoped: ${Date.now() - tSyncScan}ms (${unique.length} paths, ${trackedFiles.length} tracked)`);
     } else {
@@ -4030,31 +4136,25 @@ export class ExtractionOrchestrator {
       this.manifestEvidence = null;
       currentFiles = await scanDirectoryAsync(this.rootDir, (current, file) => {
         onProgress?.({ phase: 'scanning', current, total: 0, currentFile: file });
-      }, undefined, (evidence) => { this.manifestEvidence = evidence; });
+      }, undefined, (evidence) => { this.manifestEvidence = evidence; }, ({ relativePath, error }) => {
+        logDebug('Incomplete filesystem discovery during sync', { relativePath, error: String(error) });
+        failedDiscoveryPaths.add(relativePath);
+      });
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scan: ${Date.now() - tSyncScan}ms (${currentFiles.length} files)`);
       filesChecked = currentFiles.length;
 
-      // Full reconcile only (scoped syncs must not touch rows outside their
-      // scope): drop zero-node rows so the wiped files re-index as adds below.
-      this.healZeroNodeRows();
-
-      const tTracked = Date.now();
-      trackedFiles = this.queries.getAllFiles();
-      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-tracked-load: ${Date.now() - tTracked}ms (${trackedFiles.length} tracked)`);
+      inventory = this.fileInventoryPages();
     }
-    const currentSet = new Set(currentFiles);
-    const trackedMap = new Map<string, FileRecord>();
-    for (const f of trackedFiles) {
-      trackedMap.set(f.path, f);
-    }
+    // As the pages reconcile tracked files, this set shrinks to only adds.
+    const untrackedDiscovered = new Set(currentFiles);
 
-    // Removals: tracked in the DB but no longer a present source file. Check the
-    // filesystem directly — `scanDirectory` (via `git ls-files`) still lists a
-    // file deleted from disk but not yet staged, so set membership alone misses it.
+    // Removals and the metadata pre-filter share one stat per tracked candidate.
+    // `git ls-files` can list files deleted from disk and omit inaccessible ones.
+    // Neither an unknown stat nor a known incomplete walk establishes absence.
     // `reconcileChecks` drives the cooperative yield shared with the adds/mods loop
     // below (see SYNC_RECONCILE_YIELD_INTERVAL / issue #905).
     let reconcileChecks = 0;
-    const removeTracked = (tracked: FileRecord): void => {
+    const removeTracked = (filePath: string): void => {
       // Before the cascade deletes them, resurrect incoming cross-file
       // resolution edges as their original refs (#1240 removal case): the
       // callers live in files this sync will NOT revisit, so this is their
@@ -4064,8 +4164,8 @@ export class ExtractionOrchestrator {
       // in this loop and take the resurrected rows with them.)
       // Every name this file defined is about to stop existing here, which
       // narrows the candidate set for that name repo-wide (CG-33).
-      for (const pair of this.queries.getNodeNamePairsByFiles([tracked.path])) pairsBefore.add(pair);
-      const incoming = this.queries.getCrossFileIncomingEdgesWithTarget(tracked.path);
+      for (const pair of this.queries.getNodeNamePairsByFiles([filePath])) pairsBefore.add(pair);
+      const incoming = this.queries.getCrossFileIncomingEdgesWithTarget(filePath);
       if (incoming.length > 0) {
         const resurrected = incoming
           .map((e) => resurrectRefFromDroppedEdge(e))
@@ -4074,21 +4174,98 @@ export class ExtractionOrchestrator {
           this.queries.insertUnresolvedRefsBatch(resurrected);
         }
       }
-      onFileChange?.(tracked.path);
-      this.queries.deleteFile(tracked.path);
-      removedFilePaths.push(tracked.path);
+      onFileChange?.(filePath);
+      this.queries.deleteFile(filePath);
+      removedFilePaths.push(filePath);
       filesRemoved++;
     };
-    const removed: FileRecord[] = [];
-    for (const tracked of trackedFiles) {
-      reportCurrentFile(tracked.path);
-      if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
-        removed.push(tracked);
+    const recordUnstattable = (filePath: string, error: unknown) => {
+      logDebug('Skipping unstattable file during sync', { filePath, error: String(error) });
+      failedFilePaths.push(filePath);
+    };
+    const removed: Array<Pick<FileRecord, 'path' | 'language'>> = [];
+    const trackedNeedingContent = new Map<string, { file: FileRecord; stat: fs.Stats }>();
+    const wipedPaths: string[] = [];
+    let explicitScope: { directories: string[]; exclude: Ignore | null } | undefined;
+    const planTracked = (tracked: FileRecord): TrackedPathCheck<string> => {
+      const filePath = tracked.path;
+      if (!isScoped && needsZeroNodeRepair(tracked)) {
+        // Repair listed wipes as adds, and leave scoped sync's repair policy
+        // alone. Do not mutate the inventory until the root was rechecked.
+        return { kind: 'wipe' };
       }
-      if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
-        await new Promise<void>((resolve) => setImmediate(resolve));
+      const listed = untrackedDiscovered.delete(filePath);
+      if (!listed) {
+        if (isScoped) {
+          return { kind: 'excluded' }; // scoped candidates were filtered by policy, not by I/O
+        }
+        explicitScope ??= { directories: loadScanDirectories(this.rootDir), exclude: loadExcludeMatcher(this.rootDir) };
+        if (!matchesScanDirectories(filePath, explicitScope.directories) || explicitScope.exclude?.ignores(filePath)) {
+          return { kind: 'excluded' };
+        }
+        if (failedDiscoveryCovers(failedDiscoveryPaths, filePath)) {
+          return { kind: 'uncovered' };
+        }
+      }
+      return { kind: 'probe', listed, probe: path.join(this.rootDir, filePath) };
+    };
+    const applyTracked = (tracked: FileRecord, check: TrackedPathCheck<SyncPathObservation>): void => {
+      const filePath = tracked.path;
+      if (check.kind !== 'probe') {
+        if (check.kind === 'wipe') wipedPaths.push(filePath);
+        else if (check.kind === 'uncovered') failedFilePaths.push(filePath);
+        else removed.push({ path: filePath, language: tracked.language });
+        return;
+      }
+      const { listed, probe: observation } = check;
+      if (observation.kind === 'unknown') {
+        recordUnstattable(filePath, observation.error);
+      } else if (observation.kind === 'absent' || !listed) {
+        // Preserve the scan's other scope rules (e.g. nested gitignore).
+        // Unreported omissions are not covered by the discovery-failure guard.
+        removed.push({ path: filePath, language: tracked.language });
+      } else {
+        const { size, mtimeMs } = observation.stat;
+        // An older engine may have stored a grammar failure without a parse
+        // (#2335). Retry it even if both the stat and hash still match.
+        if (size !== tracked.size || Math.floor(mtimeMs) !== Math.floor(tracked.modifiedAt) || hasGrammarLoadFailure(tracked.errors)) {
+          trackedNeedingContent.set(filePath, { file: tracked, stat: observation.stat });
+        }
+      }
+    };
+    for (const page of inventory) {
+      if (isScoped) {
+        for (const tracked of page) {
+          reportCurrentFile(tracked.path);
+          if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          }
+          const check = planTracked(tracked);
+          applyTracked(tracked, check.kind === 'probe' ? { ...check, probe: observeSyncPath(check.probe) } : check);
+        }
+        continue;
+      }
+      for (let offset = 0; offset < page.length; offset += FULL_SYNC_STAT_CONCURRENCY) {
+        const batch = page.slice(offset, offset + FULL_SYNC_STAT_CONCURRENCY);
+        reconcileChecks += batch.length;
+        if (reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL < batch.length) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        const planned = batch.map((tracked) => {
+          reportCurrentFile(tracked.path);
+          return { tracked, check: planTracked(tracked) };
+        });
+        // Start at most one small batch of stats, and apply its decisions in
+        // inventory order even when a slow stat finishes last.
+        const observed = await Promise.all(planned.map(async ({ tracked, check }) => ({
+          tracked,
+          check: check.kind === 'probe' ? { ...check, probe: await observeSyncPathAsync(check.probe) } : check,
+        })));
+        for (const { tracked, check } of observed) applyTracked(tracked, check);
       }
     }
+    assertSameRoot();
+    for (const filePath of wipedPaths) this.queries.deleteFile(filePath);
     // The references other files make THROUGH the removed ones to files that
     // stay (a package `__init__.py` or an `index.ts` re-exporting what it
     // imports) go back to pending too: the cascade keeps their edges, and a
@@ -4100,7 +4277,7 @@ export class ExtractionOrchestrator {
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-removed-module-importers: ${Date.now() - tImporters}ms (${reopened} refs re-opened)`);
     }
     for (const tracked of removed) {
-      removeTracked(tracked);
+      removeTracked(tracked.path);
       if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
@@ -4109,43 +4286,31 @@ export class ExtractionOrchestrator {
     // Adds / modifications.
     for (const filePath of currentFiles) {
       reportCurrentFile(filePath);
-      // Same cooperative yield as the removals loop — this is the other O(files)
-      // synchronous-stat loop that wedges the main thread on a large repo (#905).
+      // Yield even when most paths are unchanged and take an early continue (#905).
       // Yield at the top of the body so the `continue` fast-paths below still hit it.
       if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
       const fullPath = path.join(this.rootDir, filePath);
-      const tracked = trackedMap.get(filePath);
-      // A row an older engine stored while the file's grammar could not load
-      // (#2335) holds no parse of these bytes: re-index it even though its
-      // size, mtime and hash all match. Rows with a real parse error are
-      // deterministic and are not retried.
-      const neverParsed = tracked !== undefined && hasGrammarLoadFailure(tracked.errors);
-
-      // Cheap pre-filter: an already-indexed file whose size AND mtime both match
-      // the DB is unchanged — skip it without reading or hashing. (A content
-      // change that preserves both exactly is the blind spot every mtime-based
-      // incremental tool accepts; `index --force` is the escape hatch. Git bumps
-      // mtime on every file it writes during checkout/merge, so pulls are caught.)
-      if (tracked && !neverParsed) {
-        try {
-          const stat = fs.statSync(fullPath);
-          if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) {
-            continue;
-          }
-        } catch (error) {
-          logDebug('Skipping unstattable file during sync', { filePath, error: String(error) });
-          failedFilePaths.push(filePath);
+      const candidate = trackedNeedingContent.get(filePath);
+      const tracked = candidate?.file;
+      if (!tracked && !untrackedDiscovered.has(filePath)) continue;
+      if (!tracked && isScoped) {
+        const observation = observeSyncPath(fullPath);
+        if (observation.kind === 'unknown') {
+          recordUnstattable(filePath, observation.error);
           continue;
         }
+        if (observation.kind === 'absent') continue;
       }
 
       // New, or size/mtime changed — read + hash to confirm a real content change.
       // (An oversize file hashes as its size stamp, unread — #1910.)
+      let read: BoundedSource;
       let content: string | null;
       try {
-        content = readSourceOrStamp(fullPath);
+        read = readBoundedSourceSync(fullPath);
+        content = sourceOrStamp(fullPath, read);
       } catch (error) {
         logDebug('Skipping unreadable file during sync', { filePath, error: String(error) });
         failedFilePaths.push(filePath);
@@ -4155,8 +4320,9 @@ export class ExtractionOrchestrator {
       // a new one is ignored, a tracked file that became one is removed.
       if (content === null) {
         if (tracked) {
+          assertSameRoot();
           reopenReferencesThroughRemovedFiles(this.queries, importReader, [tracked]);
-          removeTracked(tracked);
+          removeTracked(filePath);
         }
         continue;
       }
@@ -4168,12 +4334,14 @@ export class ExtractionOrchestrator {
         changedFilePaths.push(filePath);
         addedFilePaths.push(filePath);
         filesAdded++;
-      } else if (tracked.contentHash !== contentHash || neverParsed) {
+      } else if (tracked.contentHash !== contentHash || hasGrammarLoadFailure(tracked.errors)) {
         onFileChange?.(filePath, content);
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
         if (tracked.nodeCount === 0 && (tracked.errors?.length ?? 0) > 0) indexedFromSkip.push(filePath);
         filesModified++;
+      } else if (candidate && stableTouch(tracked, candidate.stat, read)) {
+        this.queries.advanceFileModifiedAt(tracked, read.stats.mtimeMs);
       }
     }
 
@@ -4192,7 +4360,7 @@ export class ExtractionOrchestrator {
     if (addedFilePaths.length > 0 || removedFilePaths.length > 0) this.detectionFileListChanged = true;
     const tDetect = Date.now();
     const detectedFrameworks = filesToIndex.length === 0 ? undefined : this.refreshFrameworkDetection(
-      scopedPaths && scopedPaths.length > 0 ? null : currentFiles, filesToIndex, addedFilePaths, removedFilePaths);
+      isScoped ? null : currentFiles, filesToIndex, addedFilePaths, removedFilePaths);
     if (process.env.CODEGRAPH_SYNTH_TIMINGS && filesToIndex.length > 0) {
       console.error(`[phase-timing] sync-framework-detect: ${Date.now() - tDetect}ms (${detectedFrameworks ? 'detected again' : 'unchanged'})`);
     }
@@ -4265,7 +4433,7 @@ export class ExtractionOrchestrator {
       }
     }
 
-    if (!scopedPaths || scopedPaths.length === 0) {
+    if (!isScoped) {
       this.queries.setMetadata('indexed_scope_config', scopeFingerprint);
     }
 

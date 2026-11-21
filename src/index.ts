@@ -32,6 +32,7 @@ import {
   Language,
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
+import { CURRENT_SCHEMA_VERSION, getCurrentVersion } from './db/migrations';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { logWarn } from './errors';
 import { QueryBuilder, type DeprioritizedPathMatcher } from './db/queries';
@@ -169,6 +170,7 @@ const FRAMEWORKS_SINCE_INDEX_KEY = 'frameworks_since_index';
  * its set is compared against this one as it is now.
  */
 const RESOLVER_FRAMEWORKS_AT_INDEX_KEY = 'resolver_frameworks_at_index';
+const INDEXING_EXTRACTION_VERSION_KEY = 'indexing_with_extraction_version';
 
 /** A JSON list of names from metadata, or null when absent or unreadable. */
 function parseNameList(value: string | null): string[] | null {
@@ -521,6 +523,17 @@ export class CodeGraph {
     return instance;
   }
 
+  /** Reconcile a compatible interrupted full index without replacing its database. */
+  static async resumeIndex(projectRoot: string, options: Omit<IndexOptions, 'paths' | 'signal'> = {}): Promise<SyncResult> {
+    // Inspect without migrations or index repair until sync holds the file lock.
+    const instance = CodeGraph.openSync(projectRoot, { readOnly: true });
+    try {
+      return await instance.syncWithMode(options, true);
+    } finally {
+      instance.destroy();
+    }
+  }
+
   /**
    * Rebuild the project's database from scratch and return a fresh, empty
    * instance — the "same result as a fresh init" semantics that `codegraph
@@ -721,7 +734,17 @@ export class CodeGraph {
         // mid-index (OOM, SIGKILL, the #850 liveness watchdog) leaves this
         // marker behind, so `codegraph status` can tell a truncated index
         // from a completed one instead of silently serving partial results.
-        try { this.queries.setMetadata('index_state', 'indexing'); } catch { /* metadata is advisory */ }
+        try {
+          const priorVersion = this.getIndexState() === 'indexing'
+            ? this.queries.getMetadata(INDEXING_EXTRACTION_VERSION_KEY)
+            : this.queries.getMetadata('indexed_with_extraction_version');
+          const version = String(EXTRACTION_VERSION);
+          const compatible = this.queries.getLastIndexedAt() === null || priorVersion === version;
+          this.db.getDb().transaction(() => {
+            this.queries.setMetadata(INDEXING_EXTRACTION_VERSION_KEY, compatible ? version : '');
+            this.queries.setMetadata('index_state', 'indexing');
+          })();
+        } catch { /* metadata is advisory */ }
         // Segment vocabulary. On a fresh database it starts empty, and the node
         // write path fills it as every file indexes below. Over an existing
         // graph the store skips unchanged files, which never write their names
@@ -953,6 +976,7 @@ export class CodeGraph {
               }
             }
           }
+          this.queries.setMetadata(INDEXING_EXTRACTION_VERSION_KEY, '');
         } catch { /* metadata is advisory — never fail an index over it */ }
 
         // The time covers the whole run, like the totals above. The
@@ -1144,6 +1168,37 @@ export class CodeGraph {
   }
 
   async sync(options: IndexOptions = {}): Promise<SyncResult> {
+    return this.syncWithMode(options, false);
+  }
+
+  /** Called only with the sync writer lock held and the current database opened read-only. */
+  private async prepareIndexResume(): Promise<void> {
+    const state = this.getIndexState();
+    if (state !== 'indexing') {
+      throw new Error(`Cannot resume an index in state ${state ?? 'unknown'}; only an interrupted index can be resumed. ` +
+        'Use "codegraph index" to rebuild if needed.');
+    }
+    if (this.queries.getMetadata(INDEXING_EXTRACTION_VERSION_KEY) !== String(EXTRACTION_VERSION) ||
+        getCurrentVersion(this.db.getDb()) !== CURRENT_SCHEMA_VERSION) {
+      throw new Error('Cannot resume: this interrupted index has an unknown or incompatible engine or schema version. ' +
+        'Use "codegraph index" to rebuild, or retry with the original compatible engine.');
+    }
+    loadWorkspaceConfig(this.projectRoot);
+    const previous = this.db;
+    const writable = DatabaseConnection.open(previous.getPath(), { deferIndexRecovery: true });
+    try {
+      await writable.recoverIndexesOffThread();
+      this.queries = new QueryBuilder(writable.getDb());
+    } catch (error) {
+      writable.close();
+      throw error;
+    }
+    this.db = writable;
+    previous.close();
+    this.wireLayers();
+  }
+
+  private async syncWithMode(options: IndexOptions, resume: boolean): Promise<SyncResult> {
     const {
       ESM_IMPORT_LANGUAGES,
       aliasMayName,
@@ -1188,6 +1243,15 @@ export class CodeGraph {
         throw new LockUnavailableError(
           `Sync could not open the rebuilt index yet; retry when the rebuild finishes. ${err instanceof Error ? err.message : String(err)}`
         );
+      }
+      if (resume) {
+        try {
+          await this.prepareIndexResume();
+        } catch (error) {
+          this.fileLock.release();
+          throw error;
+        }
+        options = { ...options, paths: undefined };
       }
       if (this.pendingFullReconcile) {
         // `codegraph index` recreates the file, THEN takes the write lock in
@@ -1246,12 +1310,13 @@ export class CodeGraph {
         // pin frames while the WAL grew without a bound.
         const backpressure = walValve ? () => walValve!.backpressure() : undefined;
         const fullReconcile = !options.paths || options.paths.length === 0;
+        const recoveringIndex = fullReconcile && this.getIndexState() === 'indexing';
         const gitState = this.orchestrator.beginGitIndexState(fullReconcile);
 
         const pythonFilesBefore = this.pythonFilePaths();
         // An interrupted index may have absorbed its changed files before
         // resolution/synthesis. Detect those orphans BEFORE this sync adds refs.
-        let refreshSynthesis = this.queries.getMetadata('synthesis_pending') === '1' ||
+        let refreshSynthesis = recoveringIndex || this.queries.getMetadata('synthesis_pending') === '1' ||
           this.queries.getUnresolvedReferencesCount() > 0;
         if (refreshSynthesis) this.queries.setMetadata('synthesis_pending', '1');
         // The route nodes as they were before this sync replaced or removed a
@@ -1309,7 +1374,7 @@ export class CodeGraph {
         // removal case — and runPostExtract starts by dropping the resolver's
         // name caches, which a long-lived daemon warmed against the
         // pre-removal graph.)
-        if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
+        if (recoveringIndex || result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
           this.resolver.runPostExtract();
         }
 
@@ -1844,7 +1909,7 @@ export class CodeGraph {
           }
         }
 
-        if (filesChanged || orphanCount > 0) {
+        if (recoveringIndex || filesChanged || orphanCount > 0) {
           // Second pass: chained calls whose method lives on a supertype the
           // receiver conforms to (protocol-extension / inherited). Needs the
           // implements/extends edges built above (#750).
@@ -1864,7 +1929,7 @@ export class CodeGraph {
         // follows. A full index is never held.
         let synthesized = false;
         if (refreshSynthesis) {
-          const hold = this.synthesisHoldMs();
+          const hold = recoveringIndex ? 0 : this.synthesisHoldMs();
           if (hold > 0) {
             this.armDeferredSynthesis(hold);
           } else {
@@ -1879,8 +1944,8 @@ export class CodeGraph {
 
         // A call in one file types a parameter in another, so an edit of the
         // caller can move the callee's edges. Last, as in a full index.
-        if (filesChanged || result.filesRemoved > 0 || orphanCount > 0) {
-          await this.resolver.resolveParameterFlows(flowChange);
+        if (recoveringIndex || filesChanged || result.filesRemoved > 0 || orphanCount > 0) {
+          await this.resolver.resolveParameterFlows(recoveringIndex ? undefined : flowChange);
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
@@ -1901,19 +1966,36 @@ export class CodeGraph {
           }
         } catch { /* vocab is advisory — never fail a sync over it */ }
 
-        // A killed full index leaves this marker at `indexing`. Sync repairs
-        // missing files, pending refs, and (on open) dropped indexes, so a
-        // successful recovery must also close the metadata state (#1556).
-        if (fullReconcile && this.getIndexState() === 'indexing') {
-          try { this.queries.setMetadata('index_state', 'complete'); } catch { /* advisory */ }
-        }
-
         this.orchestrator.finishGitIndexState(gitState, fullReconcile, result.failedFilePaths);
 
         if (fullReconcile && result.filesChecked > 0) this.pendingFullReconcile = false;
         // The config files this sync's resolution read join the snapshot, and
         // a changed one is recorded as it is now (#2977).
         this.stampModuleConfigSnapshotIfMoved();
+
+        // A failed source check leaves recovery retryable, not complete (#1556).
+        // Old unstamped interruptions can still use ordinary sync, but it must
+        // not advertise their retained files as having current extraction.
+        const failedPaths = result.failedFilePaths ?? [];
+        if (recoveringIndex && failedPaths.length === 0) {
+          try {
+            this.db.getDb().transaction(() => {
+              if (this.queries.getMetadata(INDEXING_EXTRACTION_VERSION_KEY) === String(EXTRACTION_VERSION)) {
+                this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
+                this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
+              }
+              this.queries.setMetadata(INDEXING_EXTRACTION_VERSION_KEY, '');
+              this.queries.setMetadata('index_state', 'complete');
+            })();
+          } catch (error) {
+            if (resume) throw error;
+            // As before, this metadata is advisory for ordinary sync.
+          }
+        }
+        if (resume && failedPaths.length > 0) {
+          throw new Error(`Source checks failed for ${failedPaths.length} file(s): ${failedPaths.slice(0, 3).join(', ')}. ` +
+            'Fix the source errors and retry "codegraph index --resume".');
+        }
         // The whole sync, as for indexAll: resolution and linking included (#2334).
         result.durationMs = Date.now() - startedAt;
         return result;

@@ -902,10 +902,11 @@ program
 program
   .command('index [path]')
   .description('Rebuild the full index from scratch (same result as a fresh init)')
+  .option('--resume', 'Recover a compatible interrupted index without replacing its database')
   .option('-f, --force', 'Index even if the path looks like your home directory or a filesystem root')
   .option('-q, --quiet', 'Suppress progress output')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
+  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean; resume?: boolean }) => {
     // An EXPLICIT path names the project to rebuild — it is never a hint to go
     // looking for one. resolveProjectPath walks up to the nearest workspace
     // ancestor, which is right for `codegraph query` run from a subdirectory,
@@ -924,6 +925,9 @@ program
       }
 
       if (!isInitialized(projectPath)) {
+        if (options.resume) {
+          throw new Error(`Nothing to resume in ${projectPath}: no initialized database. Run "codegraph init" first.`);
+        }
         error(`CodeGraph not initialized in ${projectPath}`);
         const ancestor = pathArg ? resolveProjectPath(pathArg) : projectPath;
         if (ancestor !== projectPath) {
@@ -954,6 +958,31 @@ program
         if (writer.kind === 'taken') throw new Error(writerLockHeldMessage(writer.existing, writer.pidPath));
         try {
           const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
+          const dbPath = getDatabasePath(projectPath);
+          if (options.resume) {
+            const supervision = installCommandSupervision('index', { progressPaths: [dbPath, `${dbPath}-wal`] });
+            try {
+              if (options.quiet) {
+                await CodeGraph.resumeIndex(projectPath);
+                return;
+              }
+              const clack = await importESM('@clack/prompts');
+              clack.intro('Resuming interrupted index');
+              if (options.verbose) {
+                await CodeGraph.resumeIndex(projectPath, { onProgress: createVerboseProgress(), verbose: true });
+              } else {
+                process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+                const progress = createShimmerProgress(projectPath);
+                await CodeGraph.resumeIndex(projectPath, {
+                  onProgress: progress.onProgress, activity: progress.activity,
+                }).finally(() => progress.stop());
+              }
+              clack.outro('Done');
+            } finally {
+              supervision.stop();
+            }
+            return;
+          }
           // `index` is a FULL re-index — identical to a fresh `init`. RECREATE the
           // database from scratch (discard .codegraph/codegraph.db + its WAL) rather
           // than opening the old graph and DELETE-ing every row. The clear-then-index
@@ -969,7 +998,6 @@ program
           // or if the main thread wedges — neither was guarded on this path (#999).
           // The DB + WAL paths let the liveness watchdog tell a slow store on
           // degraded storage from a true wedge (#1231).
-          const dbPath = getDatabasePath(projectPath);
           const supervision = installCommandSupervision('index', { progressPaths: [dbPath, `${dbPath}-wal`] });
           try {
             if (options.quiet) {
