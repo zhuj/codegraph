@@ -18,6 +18,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
+import { jsReceiverTypeFile } from '../src/resolution/name-matcher';
+import type { ResolutionContext } from '../src/resolution/types';
 
 let roots: string[] = [];
 let graphs: CodeGraph[] = [];
@@ -76,6 +78,34 @@ const EDITORS = "import { IDisposable } from './lifecycle';\n" +
   'export function twoReturns(flag: boolean) {\n  if (flag) {\n    return new Widget();\n  }\n  return instantiateTestCodeEditor(\'\');\n}\n';
 
 describe('a local a call initializes takes the type the called function returns', () => {
+  it('does not read imports when no initializer or callback can name a project callee', () => {
+    const source = 'const node = new Widget();\nconst format = (value: string) => value;\nnode.getModel();';
+    let importReads = 0;
+    const context: ResolutionContext = {
+      getNodesInFile: () => [],
+      getNodesByName: () => [],
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      getNodesByLowerName: () => [],
+      fileExists: () => true,
+      readFile: () => source,
+      getProjectRoot: () => '.',
+      getAllFiles: () => ['use.ts'],
+      getImportMappings: () => {
+        importReads++;
+        return [];
+      },
+    };
+
+    const file = jsReceiverTypeFile('node', {
+      fromNodeId: 'caller', referenceName: 'node.getModel', referenceKind: 'calls',
+      filePath: 'use.ts', language: 'typescript', line: 3, column: 0,
+    }, context);
+
+    expect(file).toBeUndefined();
+    expect(importReads).toBe(0);
+  });
+
   it("links the nearest declaration up a helper's returned type, through a pass-through and an imported function (vscode-be base declaration)", async () => {
     const { graph } = await index({
       'package.json': JSON.stringify({ name: 'app' }),

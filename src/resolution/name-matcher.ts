@@ -16623,6 +16623,26 @@ function isGlobalHolder(n: Node, context: ResolutionContext): boolean {
   return global;
 }
 
+const OBJECT_PATH_HOLDERS = new WeakMap<ResolutionContext, Map<string, readonly Node[]>>();
+
+/** Only the path's declarations are shared: visibility and member lookup depend on the call site. */
+function objectPathHolders(path: string, context: ResolutionContext): readonly Node[] {
+  let memo = OBJECT_PATH_HOLDERS.get(context);
+  if (!memo) OBJECT_PATH_HOLDERS.set(context, (memo = new Map()));
+  const cached = memo.get(path);
+  if (cached !== undefined) return cached;
+  const tail = path.slice(path.lastIndexOf('.') + 1);
+  // Every caller and every object-literal language belong to the web family.
+  const holders = context.getNodesByName(tail).filter((n) =>
+    (n.kind === 'constant' || n.kind === 'variable') && OBJECT_LITERAL_LANGUAGES.has(n.language) && holderPath(n) === path);
+  if (memo.size >= 4096) {
+    const oldest = memo.keys().next();
+    if (!oldest.done) memo.delete(oldest.value);
+  }
+  memo.set(path, holders);
+  return holders;
+}
+
 /**
  * Resolve `member` on the object a dotted `path` names, at `ref` (#2300):
  * `App` for `App.init()` / `window.App.init()`, `App.utils` for
@@ -16643,10 +16663,7 @@ function resolveObjectPathMember(
   host: string | null,
 ): ResolvedRef | null | undefined {
   const viaGlobal = host !== null;
-  const tail = path.slice(path.lastIndexOf('.') + 1);
-  const named = context.getNodesByName(tail).filter((n) =>
-    (n.kind === 'constant' || n.kind === 'variable') && OBJECT_LITERAL_LANGUAGES.has(n.language) &&
-    sameLanguageFamily(n.language, ref.language) && holderPath(n) === path);
+  const named = objectPathHolders(path, context);
   if (named.length === 0) return undefined;
   const hitOn = (holder: Node): ResolvedRef | null =>
     resolveObjectLiteralMember(holder, member, ref, context, 0.85, 'instance-method') ??
@@ -23207,6 +23224,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   LITERAL_PLACES.delete(context);
   THIS_CALLERS.delete(context);
   GLOBAL_HOLDERS.delete(context);
+  OBJECT_PATH_HOLDERS.delete(context);
   CLASSIC_SCRIPTS.delete(context);
   LUA_LOCALS.delete(context);
   LUA_MEMBERS.delete(context);
@@ -25125,9 +25143,10 @@ const JS_RECEIVER_CANDIDATES = new WeakMap<ResolutionContext, Map<string, { para
  * A `const`/`let`/`var` of a name whose value is a bare call (`x = f(`) or a
  * member call around a call or a `new` (`x = store.add(f(`) on a receiver
  * other than `this` or `super`, the shapes jsCallResultReading reads,
- * matched at a declaration's keyword.
+ * matched at a declaration's keyword. Consume only the keyword and its first
+ * space, like VAR_DECL_SITE, so the lookahead cannot skip other starts.
  */
-const JS_CALL_DECLARATION = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:([A-Za-z_$][\w$]*)\s*\(|(?!(?:this|super)\s*\.)[A-Za-z_$][\w$]*\s*\.\s*[A-Za-z_$][\w$]*\s*\(\s*(?:new\s+)?[A-Za-z_$][\w$]*\s*(?:\.\s*[A-Za-z_$][\w$]*\s*)?\()/y;
+const JS_CALL_DECLARATION = /\b(?:const|let|var)\s(?=\s*([A-Za-z_$][\w$]*)\s*=\s*(?:([A-Za-z_$][\w$]*)\s*\(|(?!(?:this|super)\s*\.)[A-Za-z_$][\w$]*\s*\.\s*[A-Za-z_$][\w$]*\s*\(\s*(?:new\s+)?[A-Za-z_$][\w$]*\s*(?:\.\s*[A-Za-z_$][\w$]*\s*)?\())/g;
 
 /** Bare calls whose value no project function's signature gives. */
 const JS_NOT_TYPED_CALLEE = new Set(['require', 'import', 'await', 'typeof', 'new', 'function', 'async', 'super']);
@@ -25152,21 +25171,17 @@ function jsReceiverCandidates(filePath: string, language: Language, context: Res
   const names = new Set<string>();
   const calls = new Set<string>();
   const source = jsReaderText(filePath, context);
-  // The sites of this text (not localBindingSites' memo, which holds the raw source's offsets for #2589's reader).
-  const arrows: number[] = [];
-  for (let a = source.indexOf('=>'); a !== -1; a = source.indexOf('=>', a + 2)) arrows.push(a);
-  const sites = {
-    varDecls: Array.from(source.matchAll(VAR_DECL_SITE), (m) => m.index!),
-    fnDecls: Array.from(source.matchAll(FN_DECL_SITE), (m) => m.index!),
-    arrows,
+  // Only a bare callee needs names from imports and function declarations.
+  let callees: Set<string> | undefined;
+  const hasCallee = (name: string): boolean => {
+    if (!callees) {
+      callees = new Set((context.getImportMappings?.(filePath, language) ?? []).map((m) => m.localName));
+      for (const m of source.matchAll(/\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)\s*[<(]/g)) callees.add(m[1]!);
+    }
+    return callees.has(name);
   };
-  // A bare callee is one of the project's only when the file imports or declares it.
-  const callees = new Set((context.getImportMappings?.(filePath, language) ?? []).map((m) => m.localName));
-  for (const m of source.matchAll(/\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)\s*[<(]/g)) callees.add(m[1]!);
-  for (const at of sites.varDecls) {
-    JS_CALL_DECLARATION.lastIndex = at;
-    const m = JS_CALL_DECLARATION.exec(source);
-    if (m && !(m[2] && (JS_NOT_TYPED_CALLEE.has(m[2]) || !callees.has(m[2])))) calls.add(m[1]!);
+  for (const m of source.matchAll(JS_CALL_DECLARATION)) {
+    if (!(m[2] && (JS_NOT_TYPED_CALLEE.has(m[2]) || !hasCallee(m[2])))) calls.add(m[1]!);
   }
   // A function at `fnStart` with parameters in source[open..close], when a
   // call by a bare name the file imports or declares takes it: its untyped
@@ -25179,14 +25194,14 @@ function jsReceiverCandidates(filePath: string, language: Language, context: Res
     }
     if (!found || found.every((n) => names.has(n))) return;
     const call = jsCallbackCall(source, fnStart);
-    if (!call || !callees.has(call.callee)) return;
+    if (!call || !hasCallee(call.callee)) return;
     for (const n of found) names.add(n);
   };
   const asyncBefore = (at: number): number => {
     const lead = jsWordEndingAt(source, jsPrevNonSpace(source, at));
     return lead.word === 'async' ? lead.start : at;
   };
-  for (const arrow of sites.arrows) {
+  for (let arrow = source.indexOf('=>'); arrow !== -1; arrow = source.indexOf('=>', arrow + 2)) {
     let i = jsPrevNonSpace(source, arrow);
     if (/[\w$]/.test(source[i] ?? '')) {
       // A lone parameter, `editor =>`.
@@ -25208,8 +25223,7 @@ function jsReceiverCandidates(filePath: string, language: Language, context: Res
       }
     }
   }
-  for (const at of sites.fnDecls) {
-    if (!source.startsWith('function', at)) continue;
+  for (const { index: at } of source.matchAll(/\bfunction\s/g)) {
     const open = source.indexOf('(', at);
     if (open < 0 || open - at > 200) continue;
     let depth = 0;
