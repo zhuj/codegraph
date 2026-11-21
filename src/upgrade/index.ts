@@ -15,10 +15,10 @@
  *   - **source** — a git checkout running its own `dist/`; `git pull` + rebuild.
  *
  * Detection is structural (see `detectInstallMethod`): a bundle carries a
- * vendored `node` binary and a `bin/codegraph` launcher next to its `lib/`, so
+ * Bun executable (Node in older bundles) and a launcher next to its `lib/`, so
  * we can recognize it from the running file's path without a marker file.
  *
- * Windows wrinkle: a running `node.exe` and a loaded `.node` addon are locked —
+ * Windows wrinkle: a running runtime and a loaded `.node` addon are locked —
  * they can't be overwritten or deleted, by this process or by the MCP servers
  * of open agent sessions. They CAN be renamed, so the Windows upgrade unpacks
  * the new bundle next to `current\` and swaps it in file by file, renaming each
@@ -118,7 +118,7 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
 
   // Path-based checks come FIRST. The npm thin-installer's per-platform
   // package (@colbymchenry/codegraph-<platform>-<arch>) is itself a complete
-  // bundle — vendored node + bin/ launcher — living inside node_modules, so
+  // bundle — runtime + bin/ launcher — living inside node_modules, so
   // the layout sniff below would misread every npm install as a standalone
   // bundle. `upgrade` would then curl install.sh into ~/.codegraph: a SECOND
   // install that never wins the PATH race against npm's shim, leaving
@@ -160,11 +160,11 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
   }
 
   // Bundle: <root>/lib/dist/bin/codegraph.js → <root> is up 3 from bin/.
-  // A bundle has a vendored node + a launcher script as siblings of lib/.
+  // Bun and legacy Node bundles share the same launcher and entry paths.
   const bundleRoot = P.resolve(binDir, '..', '..', '..');
-  const vendoredNode = P.join(bundleRoot, isWin ? 'node.exe' : 'node');
+  const runtimes = isWin ? ['bun.exe', 'node.exe'] : ['bun', 'node'];
   const launcher = P.join(bundleRoot, 'bin', isWin ? 'codegraph.cmd' : 'codegraph');
-  if (exists(vendoredNode) && exists(launcher)) {
+  if (runtimes.some((runtime) => exists(P.join(bundleRoot, runtime))) && exists(launcher)) {
     const os = isWin ? 'windows' : 'unix';
     return { kind: 'bundle', os, bundleRoot, installDir: deriveInstallDir(bundleRoot, os, exists) };
   }
@@ -684,7 +684,7 @@ function upgradeUnixBundle(
  * `codegraph upgrade` all replace files the same way.
  *
  * Why file-by-file renames (#2185): every open agent session runs a CodeGraph
- * MCP server from `current\`, which keeps `node.exe` and the native kernel
+ * MCP server from `current\`, which keeps the runtime and the native kernel
  * (`lib\kernel\codegraph-kernel.node`) locked. Windows refuses to overwrite or
  * delete a running exe or a loaded DLL but does let it be renamed. The old
  * upgrade renamed only `node.exe` and then `Copy-Item`ed over the rest, so the
@@ -696,15 +696,19 @@ function upgradeUnixBundle(
  * run once nothing holds them.
  */
 export const WINDOWS_SWAP_FUNCTION = String.raw`function Install-CodeGraphFiles([string]$Stage, [string]$Dest) {
-  # Move an unpacked bundle into $Dest. Windows can't overwrite or delete a
-  # running node.exe or a loaded .node addon, but it can rename one, so every
+  # Move an unpacked bundle into $Dest. Windows can't overwrite or delete an
+  # executable in use or a loaded .node addon, but it can rename one, so every
   # file being replaced (or dropped by the new version) is first renamed aside
   # to <name>.old-<token>. Any failure puts every file back, so the install is
-  # never left half-replaced or without its node.exe.
+  # never left half-replaced or without its executable.
   $ErrorActionPreference = 'Stop'
   $stageDir = (Resolve-Path -LiteralPath $Stage).ProviderPath.TrimEnd('\')
-  foreach ($need in 'node.exe', 'bin\codegraph.cmd') {
-    if (-not (Test-Path -LiteralPath (Join-Path $stageDir $need))) { throw "The CodeGraph download is incomplete (no $need); nothing was changed." }
+  foreach ($need in 'bin\codegraph.cmd', 'lib\dist\bin\codegraph.js') {
+    if (-not (Test-Path -LiteralPath (Join-Path $stageDir $need) -PathType Leaf)) { throw "The CodeGraph download is incomplete (no $need); nothing was changed." }
+  }
+  if ((-not (Test-Path -LiteralPath (Join-Path $stageDir 'bun.exe') -PathType Leaf)) -and
+      (-not (Test-Path -LiteralPath (Join-Path $stageDir 'node.exe') -PathType Leaf))) {
+    throw 'The CodeGraph download is incomplete (no bun.exe or node.exe); nothing was changed.'
   }
   $token = [guid]::NewGuid().ToString('N').Substring(0, 8)
   $asideName = '\.old-[0-9a-f]{8,32}$'
@@ -784,7 +788,7 @@ export function buildWindowsUpgradeScript(bundleRoot: string, version: string, a
   // worse UX). The bundle is unpacked into a sibling of current\ — the same
   // volume, so the swap is renames, never a half-finished copy — and nothing
   // in current\ changes until it is fully unpacked. The running process keeps
-  // its renamed node.exe mapped; the NEXT `codegraph` invocation uses the new
+  // its renamed executable mapped; the NEXT `codegraph` invocation uses the new
   // one. Exit codes: 0 installed, 1 failed with the install unchanged,
   // WINDOWS_UPGRADE_DAMAGED when the rollback could not restore every file.
   return [
@@ -839,7 +843,7 @@ function upgradeWindowsBundle(
     return 1;
   }
   deps.log('');
-  // The running node.exe was renamed aside, so the version probe in
+  // The running executable was renamed aside, so the version probe in
   // runUpgrade already exercises the NEW binary — no terminal hedge needed.
   deps.log(c.green('✓ Upgrade complete.'));
   deps.log(reindexAdvisory());

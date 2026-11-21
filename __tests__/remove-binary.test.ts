@@ -66,12 +66,11 @@ describe('planBinaryRemoval', () => {
     expect(plan.sourceRoot).toBeNull();
   });
 
-  it('a custom CODEGRAPH_INSTALL_DIR is removed wholesale (it is not the state dir)', () => {
+  it.each(['node', 'bun'])('a custom %s bundle is found and removed without its install-dir override', (runtime) => {
     const dir = '/opt/cg';
-    const present = new Set([dir, `${dir}/versions`, `${dir}/versions/v1.4.0/node`, `${dir}/versions/v1.4.0/bin/codegraph`]);
+    const present = new Set([dir, `${dir}/versions`, `${dir}/versions/v1.4.0/${runtime}`, `${dir}/versions/v1.4.0/bin/codegraph`]);
     const plan = planBinaryRemoval(probes({
       filename: `${dir}/versions/v1.4.0/lib/dist/bin/codegraph.js`,
-      env: { CODEGRAPH_INSTALL_DIR: dir },
       present,
     }));
     expect(plan.paths).toContain(dir);
@@ -187,15 +186,15 @@ describe('executeBinaryRemoval', () => {
     expect(result.npm).toBe('failed');
   });
 
-  it('windows: a locked exe inside the tree is renamed aside, then the tree deletes', () => {
+  it.each(['node.exe', 'bun.exe'])('windows: a locked %s inside the tree is renamed aside, then the tree deletes', (runtime) => {
     const dir = 'C:\\Users\\u\\AppData\\Local\\codegraph';
-    const exe = path.join(dir, 'current', 'node.exe');
+    const exe = path.win32.join(dir, 'current', runtime);
     const d = deps({ platform: 'win32', execPath: exe, rmFails: new Set([dir]) });
     const result = executeBinaryRemoval(plan({ paths: [dir] }), d);
     expect(result.removed).toEqual([dir]);
     // The renamed exe is surfaced as a leftover for the user to delete.
     expect(result.leftovers).toHaveLength(1);
-    expect(result.leftovers[0]).toContain('codegraph-old-node-');
+    expect(result.leftovers[0]).toContain('codegraph-old-runtime-');
     expect(d.calls.some((c) => c.startsWith(`mv ${exe} `))).toBe(true);
   });
 

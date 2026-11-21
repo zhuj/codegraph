@@ -1,96 +1,93 @@
 #!/usr/bin/env bash
 #
-# Build a self-contained CodeGraph bundle: an official Node runtime + the
-# compiled app + its production deps, so CodeGraph runs with NO system Node and
-# NO native build — node:sqlite is built into the bundled Node. One archive per
-# platform.
+# Build a self-contained CodeGraph bundle: an official Bun runtime + the
+# compiled app + its production deps. CodeGraph does not need a host runtime.
 #
 # Because dropping better-sqlite3 left zero native addons, the recipe is pure
-# file-packaging (download the target's Node, copy the app, archive) — so any
-# platform's bundle can be built on any OS. No cross-compile, no native runners.
+# file-packaging (download the target's Bun, copy the app, archive) — so any
+# platform's bundle can be built on any OS. A host Bun builds the app, npm
+# installs from package-lock.json, and the target Bun is never run here.
 #
 # Usage:
-#   scripts/build-bundle.sh <target> [node-version]
+#   scripts/build-bundle.sh <target> [bun-version]
 #     target:        darwin-arm64 | darwin-x64 | linux-x64 | linux-arm64
 #                  | win32-x64 | win32-arm64
-#     node-version:  e.g. v24.22.3 (default below; pin for reproducible builds)
+#     bun-version:   e.g. 1.4.4 (default below; pin for reproducible builds)
 #
 # Output:
 #   unix:    release/codegraph-<target>.tar.gz   (launcher: bin/codegraph)
 #   windows: release/codegraph-<target>.zip      (launchers: bin/codegraph + .cmd)
 set -euo pipefail
 
-TARGET="${1:?usage: build-bundle.sh <target> [node-version]}"
-# The release workflow passes no version, so this default is the Node every
-# release bundles. Keep it on 24.x (the CLI refuses Node 25+) and at 24.22.3 or
-# later. 24.22.3 is Node's November 2026 security release. Before
-# 24.20.0, Node 24 can abort on Windows just as the process exits, after its
-# work is done, with 0xC0000409 and "Assertion failed: !(handle->flags &
-# UV_HANDLE_CLOSING), file src\win\async.c" (nodejs/node#56645, fixed by
-# nodejs/node#61999; issue #2617).
-NODE_VERSION="${2:-v24.22.3}"
+TARGET="${1:?usage: build-bundle.sh <target> [bun-version]}"
+# Keep the workflow's host Bun pin in sync with this bundled runtime default.
+BUN_VERSION="${2:-1.4.4}"
+BUN_VERSION="${BUN_VERSION#v}"
+if ! [[ "$BUN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "[bundle] error: expected a Bun release version (e.g. 1.4.4), got ${BUN_VERSION}" >&2
+  exit 1
+fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/release"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-ARCH="${TARGET##*-}"   # x64 | arm64
 OSFAM="${TARGET%-*}"   # darwin | linux | win32
 
-echo "[bundle] target=${TARGET} node=${NODE_VERSION}"
+echo "[bundle] target=${TARGET} bun=${BUN_VERSION}"
 
-# 1. Download + extract the official Node runtime for the target platform. The
-#    archive must match the SHA-256 that nodejs.org publishes for the release
-#    before anything is unpacked, so a bundle ships exactly that release's
-#    official build, never a truncated or substituted download (issue #2780).
-if [ "$OSFAM" = "win32" ]; then
-  NODE_DIST="node-${NODE_VERSION}-win-${ARCH}"
-  NODE_ARCHIVE="${NODE_DIST}.zip"
-else
-  NODE_DIST="node-${NODE_VERSION}-${TARGET}"
-  NODE_ARCHIVE="${NODE_DIST}.tar.gz"
-fi
-NODE_URL="https://nodejs.org/dist/${NODE_VERSION}/${NODE_ARCHIVE}"
-echo "[bundle] downloading ${NODE_URL}"
-curl -fsSL "$NODE_URL" -o "$WORK/$NODE_ARCHIVE"
-curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/SHASUMS256.txt" -o "$WORK/SHASUMS256.txt"
-EXPECTED_SHA="$(awk -v name="$NODE_ARCHIVE" '$2 == name { print $1 }' "$WORK/SHASUMS256.txt")"
+# 1. Download + extract the official Bun runtime for the target platform.
+# Use x64 baseline builds to support CPUs without AVX2. Keep the published
+# checksum check before unpacking any archive (issue #2780).
+case "$TARGET" in
+  darwin-arm64) BUN_DIST=bun-darwin-aarch64 ;;
+  darwin-x64)   BUN_DIST=bun-darwin-x64-baseline ;;
+  linux-arm64)  BUN_DIST=bun-linux-aarch64 ;;
+  linux-x64)    BUN_DIST=bun-linux-x64-baseline ;;
+  win32-arm64)  BUN_DIST=bun-windows-aarch64 ;;
+  win32-x64)    BUN_DIST=bun-windows-x64-baseline ;;
+  *) echo "[bundle] error: unsupported target ${TARGET}" >&2; exit 1 ;;
+esac
+BUN_ARCHIVE="${BUN_DIST}.zip"
+BUN_RELEASE="https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}"
+echo "[bundle] downloading ${BUN_RELEASE}/${BUN_ARCHIVE}"
+curl -fsSL "${BUN_RELEASE}/${BUN_ARCHIVE}" -o "$WORK/$BUN_ARCHIVE"
+curl -fsSL "${BUN_RELEASE}/SHASUMS256.txt" -o "$WORK/SHASUMS256.txt"
+EXPECTED_SHA="$(awk -v name="$BUN_ARCHIVE" '$2 == name { print $1 }' "$WORK/SHASUMS256.txt")"
 if command -v sha256sum >/dev/null 2>&1; then
-  ACTUAL_SHA="$(sha256sum < "$WORK/$NODE_ARCHIVE" | cut -d' ' -f1)"
+  ACTUAL_SHA="$(sha256sum < "$WORK/$BUN_ARCHIVE" | cut -d' ' -f1)"
 else
-  ACTUAL_SHA="$(shasum -a 256 < "$WORK/$NODE_ARCHIVE" | cut -d' ' -f1)"   # macOS
+  ACTUAL_SHA="$(shasum -a 256 < "$WORK/$BUN_ARCHIVE" | cut -d' ' -f1)"   # macOS
 fi
-if [ -z "$EXPECTED_SHA" ] || [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-  echo "[bundle] error: ${NODE_ARCHIVE} does not match the SHA-256 that nodejs.org lists for ${NODE_VERSION} (listed: ${EXPECTED_SHA:-nothing}, downloaded: ${ACTUAL_SHA})" >&2
+if ! [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] || [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+  echo "[bundle] error: ${BUN_ARCHIVE} does not match Bun ${BUN_VERSION}'s published SHA-256 (listed: ${EXPECTED_SHA:-nothing}, downloaded: ${ACTUAL_SHA})" >&2
   exit 1
 fi
-echo "[bundle] verified ${NODE_ARCHIVE} against nodejs.org's SHASUMS256.txt (sha256 ${ACTUAL_SHA})"
-if [ "$OSFAM" = "win32" ]; then
-  if command -v unzip >/dev/null 2>&1; then
-    unzip -q "$WORK/$NODE_ARCHIVE" -d "$WORK"
-  else
-    tar -xf "$WORK/$NODE_ARCHIVE" -C "$WORK"   # bsdtar can read zip
-  fi
-  NODE_BIN="$WORK/${NODE_DIST}/node.exe"
+echo "[bundle] verified ${BUN_ARCHIVE} against Bun's SHASUMS256.txt (sha256 ${ACTUAL_SHA})"
+if command -v unzip >/dev/null 2>&1; then
+  unzip -q "$WORK/$BUN_ARCHIVE" -d "$WORK"
 else
-  tar -xzf "$WORK/$NODE_ARCHIVE" -C "$WORK"
-  NODE_BIN="$WORK/${NODE_DIST}/bin/node"
+  tar -xf "$WORK/$BUN_ARCHIVE" -C "$WORK"   # bsdtar can read zip
 fi
-[ -f "$NODE_BIN" ] || { echo "[bundle] error: node binary not found ($NODE_BIN)" >&2; exit 1; }
+BUN_BIN="$WORK/$BUN_DIST/bun"
+if [ "$OSFAM" = "win32" ]; then
+  BUN_BIN="${BUN_BIN}.exe"
+fi
+[ -f "$BUN_BIN" ] || { echo "[bundle] error: Bun binary not found ($BUN_BIN)" >&2; exit 1; }
 
 # 2. Build the app (compiled JS + copied wasm/schema assets).
 echo "[bundle] building app"
-( cd "$ROOT" && npm run build >/dev/null )
+( cd "$ROOT" && bun --bun run build >/dev/null )
 
 # 3. Stage: app + production-only deps (pure JS/wasm → portable across platforms).
 STAGE="$WORK/codegraph-${TARGET}"
 mkdir -p "$STAGE/lib" "$STAGE/bin"
 cp -R "$ROOT/dist" "$STAGE/lib/dist"
-# The browser viewer rides along inside dist/viewer (built by `npm run build`
+# The browser viewer rides along inside dist/viewer (built by the build script
 # above). Fail here rather than shipping a bundle whose `codegraph ui` serves
 # a 404 — the copy is verified, not assumed.
-node "$ROOT/scripts/check-ui-build.mjs" --root "$STAGE/lib"
+bun "$ROOT/scripts/check-ui-build.mjs" --root "$STAGE/lib"
 cp "$ROOT/package.json" "$ROOT/package-lock.json" "$STAGE/lib/"
 echo "[bundle] installing production dependencies"
 # The staged package.json declares the `ui` workspace but the bundle carries
@@ -121,23 +118,10 @@ else
   echo "[bundle] no native kernel for ${TARGET} — bundle uses the wasm extraction path"
 fi
 
-# 4. Vendored Node + launcher (the launcher uses the bundled Node by relative
-#    path, so no system Node is ever needed).
-#
-# `--liftoff-only`: keep tree-sitter's large WASM grammars on V8's Liftoff
-# baseline compiler so they never reach the turboshaft optimizing tier, whose
-# per-compilation Zone arena OOMs the whole process (`Fatal process out of
-# memory: Zone`) on Node >= 22 — even with tens of GB free. The flag is read at
-# V8 engine init so it must be on node's command line; the parse worker inherits
-# it. See issues #293/#298 and src/extraction/wasm-runtime-flags.ts. (The CLI
-# also self-relaunches with this flag when launched without it, so non-bundled
-# runs are covered too; passing it here avoids that extra spawn.)
-#
-# `--max-semi-space-size=16`: V8's space for new objects at Node 22's size, in
-# every thread; see NODE_RUNTIME_FLAGS in the same file.
+# 4. Vendored Bun + launchers, without Node/V8 flags.
 if [ "$OSFAM" = "win32" ]; then
-  cp "$NODE_BIN" "$STAGE/node.exe"
-  printf '@"%%~dp0..\\node.exe" --liftoff-only --disable-warning=ExperimentalWarning --max-semi-space-size=16 "%%~dp0..\\lib\\dist\\bin\\codegraph.js" %%*\r\n' \
+  cp "$BUN_BIN" "$STAGE/bun.exe"
+  printf '@"%%~dp0..\\bun.exe" "%%~dp0..\\lib\\dist\\bin\\codegraph.js" %%*\r\n' \
     > "$STAGE/bin/codegraph.cmd"
   # Git Bash (including Claude Code hooks) does not resolve .cmd via PATHEXT.
   cat > "$STAGE/bin/codegraph" <<'LAUNCH'
@@ -145,11 +129,12 @@ if [ "$OSFAM" = "win32" ]; then
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # Preserve an inherited CODEGRAPH_HOST_PPID; do not replace it with MSYS's
 # $PPID, which is not a native Windows PID usable by the orphan watchdog.
-exec "$DIR/node.exe" --liftoff-only --disable-warning=ExperimentalWarning --max-semi-space-size=16 "$DIR/lib/dist/bin/codegraph.js" "$@"
+exec "$DIR/bun.exe" "$DIR/lib/dist/bin/codegraph.js" "$@"
 LAUNCH
   chmod +x "$STAGE/bin/codegraph"
 else
-  cp "$NODE_BIN" "$STAGE/node"
+  cp "$BUN_BIN" "$STAGE/bun"
+  chmod +x "$STAGE/bun"
   cat > "$STAGE/bin/codegraph" <<'LAUNCH'
 #!/bin/sh
 # Resolve symlinks (e.g. the ~/.local/bin/codegraph link install.sh creates) so
@@ -168,11 +153,7 @@ DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 # an already-threaded value (the npm shim sets the true host pid) wins.
 CODEGRAPH_HOST_PPID="${CODEGRAPH_HOST_PPID:-$PPID}"
 export CODEGRAPH_HOST_PPID
-# --liftoff-only: avoid the V8 turboshaft WASM Zone OOM (issues #293/#298).
-# --disable-warning=ExperimentalWarning: mute node:sqlite's per-thread
-# "experimental feature" warning that otherwise interleaves with the progress UI.
-# --max-semi-space-size=16: V8's space for new objects at Node 22's size.
-exec "$DIR/node" --liftoff-only --disable-warning=ExperimentalWarning --max-semi-space-size=16 "$DIR/lib/dist/bin/codegraph.js" "$@"
+exec "$DIR/bun" "$DIR/lib/dist/bin/codegraph.js" "$@"
 LAUNCH
   chmod +x "$STAGE/bin/codegraph"
 fi

@@ -51,7 +51,7 @@ codegraph init
 
 ## Supported platforms
 
-Every release ships a self-contained build (bundled Node runtime — nothing to compile) for all three desktop OSes, on both x64 and arm64:
+Every release ships a self-contained build (bundled Bun runtime, nothing to compile) for all three desktop OSes, on both x64 and arm64:
 
 | Platform | Architectures | Install |
 |---|---|---|

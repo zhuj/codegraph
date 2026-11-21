@@ -5,6 +5,11 @@
  * knowledge graph from any codebase.
  */
 
+import { unsupportedBunReason } from './runtime';
+
+const bunVersionError = unsupportedBunReason();
+if (bunVersionError) throw new Error(bunVersionError);
+
 import { withProgressActivity, type ProgressActivity } from './progress-activity';
 import * as fs from 'fs';
 import * as path from 'path';

@@ -2,9 +2,8 @@
 #
 # CodeGraph standalone installer.
 #
-# Downloads a self-contained bundle (a vendored Node runtime + the app) from
-# GitHub Releases. No Node.js, no build tools, no npm required — ideal for a
-# fresh Linux VPS over SSH.
+# Downloads a self-contained bundle (a runtime + the app) from GitHub Releases.
+# No Bun, Node.js, npm, or build tools needed on the host.
 #
 #   curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh
 #
@@ -90,8 +89,8 @@ echo "Installed to $dest"
 echo "Linked     $BIN_DIR/codegraph"
 
 # 5. Prune older bundles so they don't pile up across upgrades (issue #1074).
-# Each release lives in its own versions/<v> dir (~50 MB with the vendored Node
-# runtime). `codegraph upgrade` re-runs this script, which drops in a new dir
+# Each release lives in its own versions/<v> dir with its runtime.
+# `codegraph upgrade` re-runs this script, which drops in a new dir
 # and re-points `current` + the launcher — but it never removed the old dirs, so
 # they accumulated indefinitely. Keep only what we just installed ($dest) and
 # delete the rest. Safe even if a daemon is still executing an older bundle: on

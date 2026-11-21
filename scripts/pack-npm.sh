@@ -3,7 +3,7 @@
 # Assemble the npm thin-installer packages from built bundles (esbuild pattern).
 #
 # Produces, under release/npm/:
-#   codegraph-<target>/   one per built bundle — the vendored Node + app, tagged
+#   codegraph-<target>/   one per built bundle — the vendored Bun + app, tagged
 #                         with os/cpu so npm installs only the matching one.
 #   main/                 the @colbymchenry/codegraph shim package: a tiny bin
 #                         that execs the matching platform bundle, with every
@@ -18,7 +18,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${1:-$(node -p "require('$ROOT/package.json').version")}"
+VERSION="${1:-$(bun -p 'require(process.argv[1]).version' "$ROOT/package.json")}"
 SCOPE="@colbymchenry"
 REL="$ROOT/release"
 NPM="$REL/npm"
@@ -48,26 +48,27 @@ for archive in "${archives[@]}"; do
       unzip -q "$archive" -d "$tmpx"
       mv "$tmpx/codegraph-${target}"/* "$pkgdir"/
       rm -rf "$tmpx"
-      nodefile="node.exe"
+      runtime="bun.exe"
       ;;
     *)
       tar -xzf "$archive" -C "$pkgdir" --strip-components=1
-      nodefile="node"
+      runtime="bun"
       ;;
   esac
+  [ -f "$pkgdir/$runtime" ] || { echo "[pack-npm] missing ${runtime} in ${fname}" >&2; exit 1; }
   # The browser viewer must survive the archive round-trip too: a tar/zip that
   # dropped dist/viewer would publish a platform package whose `codegraph ui`
   # serves a 404.
-  node "$ROOT/scripts/check-ui-build.mjs" --root "$pkgdir/lib"
-  VERSION="$VERSION" SCOPE="$SCOPE" TARGET="$target" OSV="$os" ARCHV="$arch" NODEFILE="$nodefile" \
-    node -e '
+  bun "$ROOT/scripts/check-ui-build.mjs" --root "$pkgdir/lib"
+  VERSION="$VERSION" SCOPE="$SCOPE" TARGET="$target" OSV="$os" ARCHV="$arch" RUNTIME="$runtime" \
+    bun -e '
       const fs=require("fs");
       fs.writeFileSync(process.argv[1], JSON.stringify({
         name: `${process.env.SCOPE}/codegraph-${process.env.TARGET}`,
         version: process.env.VERSION,
         description: `CodeGraph self-contained bundle for ${process.env.TARGET}`,
         os: [process.env.OSV], cpu: [process.env.ARCHV],
-        files: [process.env.NODEFILE, "lib", "bin"],
+        files: [process.env.RUNTIME, "lib", "bin"],
         license: "MIT",
         // npm --provenance refuses to publish unless this matches the repo
         // the release workflow runs in.
@@ -79,7 +80,7 @@ for archive in "${archives[@]}"; do
 done
 
 # Main shim package.
-#   npm-shim.js  CLI/MCP launcher (execs the bundled Node) — the `bin`.
+#   npm-shim.js  CLI/MCP launcher (execs the bundled Bun) — the `bin`.
 #   npm-sdk.js   programmatic/embedded entry (#354): re-exports the installed
 #                platform bundle's compiled library — the `main`.
 #   dist/        the .d.ts tree only (types). The runtime .js stays in the
@@ -90,8 +91,8 @@ cp "$ROOT/scripts/npm-sdk.js" "$NPM/main/npm-sdk.js"
 
 # Ship the type declarations so `types`/`exports.types` resolve. Built from this
 # same release, so they can't skew from the runtime npm-sdk.js re-exports.
-[ -f "$ROOT/dist/index.d.ts" ] || ( echo "[pack-npm] building dist for .d.ts" >&2 && cd "$ROOT" && npm run build >/dev/null )
-ROOT="$ROOT" DEST="$NPM/main" node -e '
+[ -f "$ROOT/dist/index.d.ts" ] || ( echo "[pack-npm] building dist for .d.ts" >&2 && cd "$ROOT" && bun --bun run build >/dev/null )
+ROOT="$ROOT" DEST="$NPM/main" bun -e '
   const fs=require("fs"), path=require("path");
   const src=path.join(process.env.ROOT,"dist"), dest=path.join(process.env.DEST,"dist");
   fs.cpSync(src, dest, { recursive:true, filter(s){
@@ -100,7 +101,7 @@ ROOT="$ROOT" DEST="$NPM/main" node -e '
 '
 
 VERSION="$VERSION" SCOPE="$SCOPE" TARGETS="${targets[*]}" \
-  node -e '
+  bun -e '
     const fs=require("fs");
     const opt={};
     for (const t of process.env.TARGETS.split(/\s+/).filter(Boolean))
@@ -143,7 +144,7 @@ if [ "${CODEGRAPH_PACK_UI:-0}" = "1" ]; then
   UIREL="$REL/npm-ui"
   rm -rf "$UIREL"
   mkdir -p "$UIREL"
-  ( cd "$ROOT" && npm run build:lib --workspace ui )
+  ( cd "$ROOT/ui" && bun --bun run build:lib )
   # `npm pack` honours "files" and works on a private package; `npm publish`
   # does not, which is exactly the guard we want to keep for now.
   ( cd "$ROOT/ui" && npm pack --pack-destination "$UIREL" >/dev/null )

@@ -2,9 +2,9 @@
 //
 // Programmatic / embedded SDK entry for @colbymchenry/codegraph (issue #354).
 //
-// The CLI/MCP `bin` (npm-shim.js) execs the per-platform bundle's OWN Node 24 so
-// the tool never depends on the user's runtime. Embedded library consumers are
-// the opposite case: they already run their own Node and just want the compiled
+// The CLI/MCP `bin` (npm-shim.js) runs the per-platform bundle's own Bun, so
+// the app does not inherit the shim's runtime. Embedded library consumers are
+// the opposite case: they run their own Node or Bun and just want the compiled
 // API — `require("@colbymchenry/codegraph")` returning the CodeGraph class et al.
 //
 // The compiled library + its production dependencies (web-tree-sitter,
@@ -16,12 +16,11 @@
 // package ships its own dist/**/*.d.ts tree (pointed at by `types`), built from
 // the same release so it can never skew from the runtime it re-exports.
 //
-// node:sqlite (Node >= 22.5) is required to OPEN a graph, but only lazily inside
+// node:sqlite (Node >= 22.5 or Bun >= 1.4.4) is required to OPEN a graph, lazily inside
 // the SQLite adapter — so loading this module is safe on older Node, and the
 // node:sqlite requirement surfaces with an actionable error only when a DB is
-// actually opened. Heavy extraction additionally wants the bundled launcher's
-// --liftoff-only flag (the WASM Zone-OOM guard, issues #293/#298); an embedded
-// host that drives large indexing should pass that flag to its own Node.
+// actually opened. Embedded Node hosts doing heavy extraction should pass
+// --liftoff-only (the V8 WASM Zone-OOM guard, issues #293/#298); Bun needs no flag.
 
 var path = require('path');
 var os = require('os');

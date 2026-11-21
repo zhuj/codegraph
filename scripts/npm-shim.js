@@ -3,13 +3,12 @@
 //
 // npm thin-installer launcher for CodeGraph.
 //
-// The heavy artifact (a vendored Node runtime + the app) ships as a per-platform
+// The heavy artifact (a vendored runtime + the app) ships as a per-platform
 // optionalDependency: @colbymchenry/codegraph-<platform>-<arch>. npm installs
 // only the one matching the host, via each package's `os`/`cpu` fields (the
 // esbuild pattern). This shim — run by the user's OWN Node — locates that bundle
-// and execs its launcher, so the real work always runs on the bundled Node 24
-// (with node:sqlite), regardless of the user's Node version. The user's Node is
-// only ever a launcher; even an ancient version can run this file.
+// and runs the app with bundled Bun (Node for older bundles). The user's Node
+// only runs the shim, so it can be an older version.
 //
 // Self-heal (issue #303): some registries — notably the npmmirror/cnpm mirrors,
 // and some corporate proxies — don't reliably mirror the per-platform
@@ -65,15 +64,12 @@ async function main() {
 // Resolve the launcher from the installed per-platform optionalDependency.
 // Returns {command, args} or null if the package isn't installed.
 function resolveInstalledBundle() {
+  if (isWindows) {
+    return windowsLauncher(function (file) {
+      try { return require.resolve(pkg + '/' + file); } catch (e) { return null; }
+    });
+  }
   try {
-    if (isWindows) {
-      // Modern Node refuses to spawn the bundle's .cmd directly (EINVAL, the
-      // CVE-2024-27980 hardening on Node 24), so invoke the bundled node.exe
-      // against the app entry point and pass --liftoff-only here.
-      var nodeExe = require.resolve(pkg + '/node.exe');
-      var entry = require.resolve(pkg + '/lib/dist/bin/codegraph.js');
-      return { command: nodeExe, args: liftoff(entry) };
-    }
     return { command: require.resolve(pkg + '/bin/codegraph'), args: process.argv.slice(2) };
   } catch (e) {
     return null;
@@ -81,25 +77,33 @@ function resolveInstalledBundle() {
 }
 
 // Locate the launcher inside an extracted GitHub bundle directory (same
-// node/lib/bin layout as the npm platform package). Returns {command, args} or
+// runtime/lib/bin layout as the npm platform package). Returns {command, args} or
 // null when the directory doesn't hold a usable bundle yet.
 function launcherIn(dir) {
   if (isWindows) {
-    var nodeExe = path.join(dir, 'node.exe');
-    var entry = path.join(dir, 'lib', 'dist', 'bin', 'codegraph.js');
-    if (fs.existsSync(nodeExe) && fs.existsSync(entry)) {
-      return { command: nodeExe, args: liftoff(entry) };
-    }
-  } else {
-    var launcher = path.join(dir, 'bin', 'codegraph');
-    if (fs.existsSync(launcher)) return { command: launcher, args: process.argv.slice(2) };
+    return windowsLauncher(function (file) {
+      var candidate = path.join(dir, file);
+      return fs.existsSync(candidate) ? candidate : null;
+    });
   }
-  return null;
+  var launcher = path.join(dir, 'bin', 'codegraph');
+  return fs.existsSync(launcher) ? { command: launcher, args: process.argv.slice(2) } : null;
+}
+
+// Modern Node refuses to spawn the bundle's .cmd directly; invoke the runtime
+// against the entry point instead. Only legacy Node bundles need V8 flags.
+function windowsLauncher(resolveFile) {
+  var entry = resolveFile('lib/dist/bin/codegraph.js');
+  if (!entry) return null;
+  var bunExe = resolveFile('bun.exe');
+  if (bunExe) return { command: bunExe, args: [entry].concat(process.argv.slice(2)) };
+  var nodeExe = resolveFile('node.exe');
+  return nodeExe ? { command: nodeExe, args: liftoff(entry) } : null;
 }
 
 // --liftoff-only keeps tree-sitter's WASM grammars off V8's turboshaft tier to
-// avoid the Zone OOM on Node >= 22 (issues #293/#298). The unix bin/codegraph
-// launcher already passes it; on Windows we invoke node.exe directly so add it.
+// avoid the Zone OOM on Node >= 22 (issues #293/#298). Legacy Unix launchers
+// already pass it; on Windows we invoke node.exe directly so add it.
 // --disable-warning=ExperimentalWarning mutes node:sqlite's per-thread
 // "experimental feature" warning, which otherwise prints once per parse worker
 // mid-index, shredding the progress UI. --max-semi-space-size=16 keeps V8's
@@ -252,7 +256,7 @@ function rmrf(p) {
 // Drop sibling bundles for OTHER versions of this same platform target, keeping
 // only keepDir. The self-heal cache otherwise accumulates a full ~50 MB bundle
 // per version forever (issue #1074). Best-effort: a locked/busy dir (a
-// concurrent run still mapping an older node.exe on Windows) just stays — rmrf
+// concurrent run still mapping an older runtime on Windows) just stays — rmrf
 // already swallows its own errors, and the readdir is guarded — so cleanup can
 // never break a working command. Only this target's "<target>-<version>" dirs
 // are touched; other platforms' bundles and the ".dl-*" staging dirs are left

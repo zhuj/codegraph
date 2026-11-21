@@ -565,6 +565,17 @@ codegraph version                 # Print the installed version (also -v, --vers
 codegraph help [command]          # Show help, optionally for one command
 ```
 
+### Run the compiled CLI with Bun
+
+From a built checkout, you can opt in to Bun 1.4.4 or later:
+
+```bash
+bun dist/bin/codegraph.js --version
+bun dist/bin/codegraph.js sync /path/to/project
+```
+
+Standalone release bundles include Bun, so you do not need to install it separately. The compiled library also supports Node.js. On Bun, CodeGraph uses the `node:sqlite` compatibility layer and loads the same optional Rust addon as on Node.js when a compatible binary is available. Set `CODEGRAPH_KERNEL=0` to use the WASM extractor instead.
+
 ### Indexing progress and linking performance
 
 Interactive `init`, `index`, and `sync` show the directory currently being
@@ -695,9 +706,10 @@ that drive the graph directly: `DatabaseConnection`, `QueryBuilder`,
 - Install from npm (`npm i @colbymchenry/codegraph`) so the matching
   per-platform package — which carries the compiled library and its
   dependencies — is fetched alongside the shim.
-- The API runs on **your** runtime, so it needs **Node 22.5+** for the built-in
+- On Node.js the API needs **Node 22.5+** for the built-in
   `node:sqlite` (Electron qualifies when its bundled Node is 22.5+). The CLI and
   MCP server are unaffected — they run on the self-contained bundled runtime.
+- On Bun the API needs **Bun 1.4.4+** and uses its `node:sqlite` compatibility layer.
 - TypeScript types ship with the package. As with any Node-targeting library,
   keep `@types/node` available and `skipLibCheck: true` (the common default).
 
@@ -908,15 +920,15 @@ carries cryptographic proof of it:
   gh attestation verify codegraph-darwin-arm64.tar.gz -R colbymchenry/codegraph
   ```
 
-- **The bundled Node.js runtime** is checked against the SHA-256 checksums
-  nodejs.org publishes before it goes into a bundle.
+- **The bundled Bun runtime** is checked against its upstream SHA-256 digest
+  before it goes into a bundle.
 
 Releases published before July 2026 predate this pipeline and don't carry
 attestations.
 
 ## Supported Platforms
 
-Every release ships a self-contained build (bundled Node runtime — nothing to
+Every release ships a self-contained build (bundled Bun runtime — nothing to
 compile) for all three desktop OSes, on both Intel/AMD (x64) and ARM (arm64):
 
 | Platform | Architectures | Install |
@@ -1039,7 +1051,7 @@ Framework routing is validated the same way, on a canonical app per framework: E
 
 **Indexing is slow** — Check that `node_modules` and other large directories are excluded. Use `--quiet` to reduce output overhead.
 
-**MCP hits `database is locked`** — current builds shouldn't: CodeGraph bundles its own Node runtime and uses Node's built-in `node:sqlite` in WAL mode, where concurrent reads never block on a writer. If you still see it:
+**MCP hits `database is locked`** — CodeGraph uses SQLite in WAL mode, which lets readers run alongside a writer. If you still see it:
 
 - **You're on an old (pre-0.9) install.** Reinstall to get the bundled runtime — `curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh` (macOS/Linux), `irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex` (Windows), or `npm i -g @colbymchenry/codegraph@latest`.
 - **`codegraph status` shows `Journal:` other than `wal`** — WAL couldn't be enabled on this filesystem (common on network shares and WSL2 `/mnt`), so reads can block on writes. Move the project (with its `.codegraph/` folder) onto a local disk.

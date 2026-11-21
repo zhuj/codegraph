@@ -12,12 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Security
-
-- Release bundles now include Node.js 24.22.3 with the November security fixes.
-
 ### New Features
 
+- Standalone bundles now include Bun, and the compiled library also runs under Bun 1.4.4 or later.
 - Animated indexing and sync progress shows the current directory in brackets without redrawing for every file or directory change.
 - Dynamic-dispatch linking reuses bounded source-line offsets and avoids unnecessary language scans and large temporary edge arrays.
 

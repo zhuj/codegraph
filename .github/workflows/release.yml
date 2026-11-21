@@ -96,6 +96,10 @@ jobs:
           # No registry-url here: it writes an .npmrc that requires a
           # NODE_AUTH_TOKEN env var to exist, and we publish via OIDC
           # trusted publishing instead of a token.
+      # Host build runtime; keep the pin in sync with scripts/build-bundle.sh.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
 
       - name: Upgrade npm for OIDC trusted publishing
         # Trusted publishing needs npm >= 11.5; Node 22 bundles npm 10.

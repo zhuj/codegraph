@@ -1,7 +1,7 @@
 # CodeGraph standalone installer for Windows (PowerShell).
 #
-# Downloads a self-contained bundle (a vendored Node runtime + the app) from
-# GitHub Releases. No Node.js, no build tools required.
+# Downloads a self-contained bundle (a runtime + the app) from GitHub Releases.
+# No Bun, Node.js, or build tools needed on the host.
 #
 #   irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex
 #
@@ -17,15 +17,19 @@ $ErrorActionPreference = 'Stop'
 
 # >>> Install-CodeGraphFiles -- keep identical to WINDOWS_SWAP_FUNCTION in src/upgrade/index.ts
 function Install-CodeGraphFiles([string]$Stage, [string]$Dest) {
-  # Move an unpacked bundle into $Dest. Windows can't overwrite or delete a
-  # running node.exe or a loaded .node addon, but it can rename one, so every
+  # Move an unpacked bundle into $Dest. Windows can't overwrite or delete an
+  # executable in use or a loaded .node addon, but it can rename one, so every
   # file being replaced (or dropped by the new version) is first renamed aside
   # to <name>.old-<token>. Any failure puts every file back, so the install is
-  # never left half-replaced or without its node.exe.
+  # never left half-replaced or without its executable.
   $ErrorActionPreference = 'Stop'
   $stageDir = (Resolve-Path -LiteralPath $Stage).ProviderPath.TrimEnd('\')
-  foreach ($need in 'node.exe', 'bin\codegraph.cmd') {
-    if (-not (Test-Path -LiteralPath (Join-Path $stageDir $need))) { throw "The CodeGraph download is incomplete (no $need); nothing was changed." }
+  foreach ($need in 'bin\codegraph.cmd', 'lib\dist\bin\codegraph.js') {
+    if (-not (Test-Path -LiteralPath (Join-Path $stageDir $need) -PathType Leaf)) { throw "The CodeGraph download is incomplete (no $need); nothing was changed." }
+  }
+  if ((-not (Test-Path -LiteralPath (Join-Path $stageDir 'bun.exe') -PathType Leaf)) -and
+      (-not (Test-Path -LiteralPath (Join-Path $stageDir 'node.exe') -PathType Leaf))) {
+    throw 'The CodeGraph download is incomplete (no bun.exe or node.exe); nothing was changed.'
   }
   $token = [guid]::NewGuid().ToString('N').Substring(0, 8)
   $asideName = '\.old-[0-9a-f]{8,32}$'
@@ -133,7 +137,7 @@ $version = Resolve-CodeGraphVersion $env:CODEGRAPH_VERSION $repo
 # 3. Download the bundle and unpack it next to the stable 'current' dir (same
 # volume, so moving it in is renames, not copies), then move it into 'current'.
 # 'current' is never deleted wholesale: a CodeGraph process that is still
-# running (an agent session's MCP server) holds node.exe and the native kernel,
+# running (an agent session's MCP server) holds the runtime and the native kernel,
 # which can't be deleted -- Install-CodeGraphFiles renames them aside instead.
 $url = "https://github.com/$repo/releases/download/$version/codegraph-$target.zip"
 Write-Host "Installing CodeGraph $version ($target)..."

@@ -116,13 +116,14 @@ export function buildRelaunchArgv(
 /**
  * If the current process is missing the WASM runtime flags, re-exec it once
  * with them and exit with the child's status. No-op when the flags are already
- * present (the normal bundled-launcher path), when already relaunched, or when
- * disabled via CODEGRAPH_NO_RELAUNCH.
+ * present (the normal bundled-launcher path), when already relaunched, when
+ * disabled via CODEGRAPH_NO_RELAUNCH, or on Bun (which does not use V8).
  *
  * On spawn failure, returns so the caller runs in-process anyway — risking the
  * OOM is still better than refusing to start.
  */
 export function relaunchWithWasmRuntimeFlagsIfNeeded(scriptPath: string): void {
+  if (process.versions.bun !== undefined) return;
   if (processHasWasmRuntimeFlags()) return;
   if (process.env[RELAUNCH_GUARD_ENV]) return;
   if (process.env.CODEGRAPH_NO_RELAUNCH) return;

@@ -23,6 +23,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { createRequire } from 'node:module';
+import { runInNewContext } from 'node:vm';
 import type { AddressInfo } from 'net';
 
 const SHIM_SRC = path.join(__dirname, '..', 'scripts', 'npm-shim.js');
@@ -94,6 +96,54 @@ describe('npm-shim windowsHide (#1092)', () => {
     for (const line of spawnLines) {
       expect(line, `spawn without windowsHide: ${line.trim()}`).toContain('windowsHide: true');
     }
+  });
+});
+
+describe('npm-shim Windows bundle resolution', () => {
+  describe.each(['package', 'cache'])('from the %s', (source) => {
+    it.each([
+      { runtimes: ['bun.exe'], executable: 'bun.exe', flags: [] },
+      { runtimes: ['node.exe', 'bun.exe'], executable: 'bun.exe', flags: [] },
+      { runtimes: ['node.exe'], executable: 'node.exe', flags: [
+        '--liftoff-only', '--disable-warning=ExperimentalWarning', '--max-semi-space-size=16',
+      ] },
+    ])('launches $executable with the right flags when the bundle contains $runtimes', async ({ runtimes, executable, flags }) => {
+      const version = '1.2.3-test';
+      const pkg = makePkg(version);
+      const bundle = source === 'package'
+        ? path.join(pkg, 'node_modules', '@colbymchenry', 'codegraph-win32-x64')
+        : path.join(pkg, 'bundles', `win32-x64-${version}`);
+      const shim = path.join(pkg, 'npm-shim.js');
+      const entry = path.join(bundle, 'lib', 'dist', 'bin', 'codegraph.js');
+      const args = ['explore', 'two words', '--mcp'];
+      const launched: Array<{ command: string; argv: string[] }> = [];
+      const actualRequire = createRequire(shim);
+      const windowsRequire = Object.assign((name: string) => name === 'child_process'
+        ? { spawnSync: (command: string, argv: string[]) => { launched.push({ command, argv }); return { status: 0 }; } }
+        : actualRequire(name), { resolve: actualRequire.resolve });
+      try {
+        fs.mkdirSync(path.dirname(entry), { recursive: true });
+        fs.writeFileSync(entry, '');
+        for (const runtime of runtimes) fs.writeFileSync(path.join(bundle, runtime), '');
+        await runInNewContext(fs.readFileSync(shim, 'utf8'), {
+          __dirname: pkg,
+          require: windowsRequire,
+          process: {
+            platform: 'win32', arch: 'x64', argv: ['node', shim, ...args], ppid: 42,
+            env: { CODEGRAPH_INSTALL_DIR: pkg, CODEGRAPH_NO_DOWNLOAD: '1' },
+            stderr: { write: () => {} },
+            exit: () => {},
+          },
+        });
+        const expected = source === 'package' ? fs.realpathSync(bundle) : bundle;
+        expect(launched).toEqual([{
+          command: path.join(expected, executable),
+          argv: [...flags, path.join(expected, 'lib', 'dist', 'bin', 'codegraph.js'), ...args],
+        }]);
+      } finally {
+        fs.rmSync(pkg, { recursive: true, force: true });
+      }
+    });
   });
 });
 

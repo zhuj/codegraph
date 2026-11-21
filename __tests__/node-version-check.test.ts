@@ -6,6 +6,10 @@
  * load-bearing — if any of them get edited away, this test catches it.
  */
 
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { describe, it, expect } from 'vitest';
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from '../src/bin/node-version-check';
 
@@ -65,5 +69,72 @@ describe('buildNodeTooOldBanner', () => {
 
   it('documents the CODEGRAPH_ALLOW_UNSAFE_NODE override', () => {
     expect(buildNodeTooOldBanner('18.0.0')).toContain('CODEGRAPH_ALLOW_UNSAFE_NODE=1');
+  });
+});
+
+const cli = resolve(__dirname, '../dist/bin/codegraph.js');
+const library = resolve(__dirname, '../dist/index.js');
+
+/** Model runtimes that may not be installed on the Node test runner. */
+function launchAsBun(version: string, args: string[], allowUnsafeNode = false) {
+  const dir = mkdtempSync(join(tmpdir(), 'cg-bun-startup-'));
+  try {
+    const preload = join(dir, 'runtime.cjs');
+    writeFileSync(preload, `
+      Object.defineProperties(process.versions, {
+        bun: { value: ${JSON.stringify(version)} },
+        node: { value: '26.3.0' },
+      });
+      const cp = require('node:child_process');
+      const spawnSync = cp.spawnSync;
+      cp.spawnSync = (executable, args, ...options) => {
+        if (args.includes('--liftoff-only')) throw Error('Unexpected V8 relaunch under Bun');
+        return spawnSync(executable, args, ...options);
+      };
+    `);
+    const env = { ...process.env };
+    delete env.CODEGRAPH_ALLOW_UNSAFE_NODE;
+    delete env.CODEGRAPH_NO_RELAUNCH;
+    delete env.CODEGRAPH_WASM_RELAUNCHED;
+    if (allowUnsafeNode) env.CODEGRAPH_ALLOW_UNSAFE_NODE = '1';
+    return spawnSync(process.execPath, ['--require', preload, ...args], {
+      encoding: 'utf8', env, timeout: 10_000,
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('compiled entry points under Bun', () => {
+  it.each(['1.4.4', '1.4.10', '1.5.0', '2.0.0'])(
+    'starts on Bun %s without a Node override or V8 relaunch', (version) => {
+      const result = launchAsBun(version, [cli, '--version']);
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+      expect(result.stderr).not.toContain('Unsupported Node.js');
+    },
+  );
+
+  it.each(['1.3.99', '1.4.3', '1.4.4-canary.1'])(
+    'rejects Bun %s even when the Node override is set', (version) => {
+      const result = launchAsBun(version, [cli, '--version'], true);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(`Bun ${version}`);
+      expect(result.stderr).toContain('1.4.4');
+      expect(result.stderr).not.toContain('Unsupported Node.js');
+      expect(result.stderr).not.toContain('Unexpected V8 relaunch');
+    },
+  );
+
+  it('allows the compiled library to load on Bun 1.4.4', () => {
+    const result = launchAsBun('1.4.4', ['-e', `require(${JSON.stringify(library)});`]);
+    expect(result.status, result.stderr).toBe(0);
+  });
+
+  it('rejects loading the compiled library on Bun 1.4.3', () => {
+    const result = launchAsBun('1.4.3', ['-e', `require(${JSON.stringify(library)});`]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Bun 1.4.3');
+    expect(result.stderr).toContain('1.4.4');
   });
 });

@@ -29,7 +29,7 @@
  *   - The bin-dir shim is removed only when it verifiably points into a
  *     detected install dir — a user's unrelated `codegraph` file survives.
  *   - Windows cannot DELETE a running exe but CAN rename it (the same
- *     trick the in-place upgrade uses): a locked `node.exe` is renamed
+ *     trick the in-place upgrade uses): a locked runtime executable is renamed
  *     aside and reported as a leftover for the user to delete after the
  *     window closes, instead of failing the whole removal.
  */
@@ -65,7 +65,7 @@ export interface BinaryRemovalPlan {
   npmGlobal: boolean;
   /**
    * npm's global node_modules root (for the Windows locked-exe dance — the
-   * vendored node.exe lives in the SIBLING per-platform package, so the
+   * bundled runtime lives in the SIBLING per-platform package, so the
    * whole root is the lock surface, not just the meta package's dir).
    */
   npmRoot: string | null;
@@ -213,7 +213,7 @@ export function planBinaryRemoval(p: RemoveBinaryProbes): BinaryRemovalPlan {
 
 export interface RemoveBinaryDeps {
   platform: NodeJS.Platform;
-  /** The running node binary — the file Windows will hold a lock on. */
+  /** The running runtime executable, which Windows will lock. */
   execPath: string;
   rm: (p: string) => void;
   rename: (from: string, to: string) => void;
@@ -242,7 +242,7 @@ export function defaultRemoveDeps(): RemoveBinaryDeps {
 }
 
 /**
- * Rename the running (locked) node.exe out of `dir` so the rest of the tree
+ * Rename the running (locked) executable out of `dir` so the rest of the tree
  * deletes cleanly — Windows allows renaming a mapped image, just not deleting
  * it. Returns the leftover path, or null when nothing needed moving.
  */
@@ -251,7 +251,7 @@ function moveLockedExeAside(dir: string, deps: RemoveBinaryDeps): string | null 
   const P = pathFor(deps.platform);
   const resolvedDir = P.resolve(dir) + P.sep;
   if (!P.resolve(deps.execPath).startsWith(resolvedDir)) return null;
-  const leftover = P.join(P.dirname(P.resolve(dir)), `codegraph-old-node-${process.pid}.exe`);
+  const leftover = P.join(P.dirname(P.resolve(dir)), `codegraph-old-runtime-${process.pid}.exe`);
   try {
     deps.rename(deps.execPath, leftover);
     return leftover;

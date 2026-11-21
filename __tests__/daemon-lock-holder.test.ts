@@ -123,6 +123,10 @@ describe('what a lock holder is (#2770)', () => {
       '"C:\\Program Files\\nodejs\\node.exe" --liftoff-only --disable-warning=ExperimentalWarning ' +
       '"C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@colbymchenry\\codegraph\\lib\\dist\\bin\\codegraph.js" serve --mcp --path D:\\proj',
     )).toBe(true);
+    expect(isCodeGraphServerCommandLine(
+      '"C:\\Program Files\\CodeGraph\\current\\bun.exe" ' +
+      '"C:\\Program Files\\CodeGraph\\current\\lib\\dist\\bin\\codegraph.js" serve --mcp --path D:\\proj',
+    )).toBe(true);
     expect(isCodeGraphServerCommandLine('/opt/codegraph/node /opt/codegraph/lib/dist/bin/codegraph.js serve --mcp --path /src/app')).toBe(true);
     expect(isCodeGraphServerCommandLine('node /usr/lib/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js index')).toBe(false);
     expect(isCodeGraphServerCommandLine('node server.js serve --mcp')).toBe(false);
@@ -137,6 +141,7 @@ describe('what a lock holder is (#2770)', () => {
     // executable that is no JavaScript runtime rules the holder out.
     expect(classifyLockHolder({ name: 'svchost.exe', commandLine: null })).toBe('other');
     expect(classifyLockHolder({ name: 'node.exe', commandLine: null })).toBe('unknown');
+    expect(classifyLockHolder({ name: 'bun.exe', commandLine: null })).toBe('unknown');
     expect(classifyLockHolder({ name: '/usr/local/bin/node', commandLine: null })).toBe('unknown');
     expect(classifyLockHolder({ name: null, commandLine: null })).toBe('unknown');
   });

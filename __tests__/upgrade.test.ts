@@ -32,15 +32,15 @@ import { CodeGraph } from '../src';
 // ---------------------------------------------------------------------------
 
 describe('detectInstallMethod', () => {
-  // A bundle exists if a vendored node + launcher sit next to lib/.
+  // A bundle exists if a bundled runtime and launcher sit next to lib/.
   function bundleExists(present: Set<string>) {
     return (p: string) => present.has(p.replace(/\\/g, '/'));
   }
 
-  it('detects a unix bundle and derives the install dir from the versions/ layout', () => {
+  it.each(['node', 'bun'])('detects a unix %s bundle and derives the install dir from versions/', (runtime) => {
     const root = '/home/u/.codegraph/versions/v0.9.9';
     const filename = `${root}/lib/dist/bin/codegraph.js`;
-    const present = new Set([`${root}/node`, `${root}/bin/codegraph`, '/home/u/.codegraph']);
+    const present = new Set([`${root}/${runtime}`, `${root}/bin/codegraph`, '/home/u/.codegraph']);
     const m = detectInstallMethod({
       filename,
       platform: 'linux',
@@ -55,10 +55,10 @@ describe('detectInstallMethod', () => {
     });
   });
 
-  it('detects a windows bundle and derives the install dir from current\\', () => {
+  it.each(['node.exe', 'bun.exe'])('detects a windows %s bundle and derives the install dir from current\\', (runtime) => {
     const root = 'C:/Users/u/AppData/Local/codegraph/current';
     const filename = `${root}/lib/dist/bin/codegraph.js`;
-    const present = new Set([`${root}/node.exe`, `${root}/bin/codegraph.cmd`]);
+    const present = new Set([`${root}/${runtime}`, `${root}/bin/codegraph.cmd`]);
     const m = detectInstallMethod({
       filename,
       platform: 'win32',
@@ -96,14 +96,14 @@ describe('detectInstallMethod', () => {
   });
 
   // The npm thin-installer's per-platform package IS a complete bundle
-  // (vendored node + bin/ launcher) sitting inside node_modules. The layout
+  // (bundled runtime + bin/ launcher) sitting inside node_modules. The layout
   // sniff must not win over the node_modules path check, or `upgrade` curls
   // install.sh into ~/.codegraph — a second install that loses the PATH race
   // to npm's shim, so `codegraph -v` stays on the old version forever.
   it('detects the npm thin-installer platform package as npm, not bundle', () => {
     const root = '/usr/local/lib/node_modules/@colbymchenry/codegraph/node_modules/@colbymchenry/codegraph-linux-x64';
     const filename = `${root}/lib/dist/bin/codegraph.js`;
-    const present = new Set([`${root}/node`, `${root}/bin/codegraph`]);
+    const present = new Set([`${root}/bun`, `${root}/bin/codegraph`]);
     const m = detectInstallMethod({
       filename,
       platform: 'linux',
@@ -391,8 +391,11 @@ describe('windows bundle swap script (#2185)', () => {
 
   it('refuses a download that is not a bundle before touching current\\', () => {
     const code = swapCode();
-    expect(code).toContain("foreach ($need in 'node.exe', 'bin\\codegraph.cmd')");
+    expect(code).toContain("foreach ($need in 'bin\\codegraph.cmd', 'lib\\dist\\bin\\codegraph.js')");
     expect(code.indexOf("foreach ($need in")).toBeLessThan(code.indexOf('try {'));
+    const beforeTry = code.slice(0, code.indexOf('try {'));
+    expect(beforeTry).toMatch(/if \(\(-not \(Test-Path[^\n]+bun\.exe[^\n]+\)\) -and\s*\(-not \(Test-Path[^\n]+node\.exe[^\n]+\)\)\)/);
+    expect(beforeTry).toContain('nothing was changed.');
   });
 
   it('cleans up renamed-aside leftovers, including ones from earlier upgrades', () => {
@@ -401,6 +404,7 @@ describe('windows bundle swap script (#2185)', () => {
     const aside = new RegExp(m![1]!, 'i'); // PowerShell -match is case-insensitive
     // The pre-fix upgrade left node.exe.old-<32-hex guid>; this one uses 8 hex.
     expect(aside.test('node.exe.old-0123456789abcdef0123456789ABCDEF')).toBe(true);
+    expect(aside.test('bun.exe.old-deadbeef')).toBe(true);
     expect(aside.test('codegraph-kernel.node.old-deadbeef')).toBe(true);
     for (const shipped of ['node.exe', 'codegraph-kernel.node', 'old-deadbeef.js', 'x.old-1234567', 'a.old-deadbeef.js']) {
       expect(aside.test(shipped), shipped).toBe(false);

@@ -10,7 +10,7 @@ const bash = windows
   ? path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Git/bin/bash.exe')
   : 'bash';
 const recipe = fs.readFileSync(path.resolve('scripts/build-bundle.sh'), 'utf8');
-// Execute the release recipe itself, without downloading Node or rebuilding the UI.
+// Execute the release recipe itself without downloading Bun or rebuilding the UI.
 const launcherRecipe = recipe.slice(recipe.indexOf('# 4. Vendored'), recipe.indexOf('# 5. Archive'));
 const archiveRecipe = recipe.slice(recipe.indexOf('# 5. Archive'));
 const roots: string[] = [];
@@ -36,15 +36,17 @@ function stage(osfam = windows ? 'win32' : process.platform) {
   fs.mkdirSync(path.join(bundle, 'bin'), { recursive: true });
   fs.mkdirSync(path.join(bundle, 'lib/dist/bin'), { recursive: true });
   const convert = windows ? '$(cygpath -u "$1")' : '$1';
-  const node = windows ? '$(cygpath -u "$2")' : '$2';
-  const result = shell(`set -eu\nSTAGE="${convert}"\nNODE_BIN="${node}"\nOSFAM="$3"\n${launcherRecipe}`, [bundle, process.execPath, osfam]);
+  const runtime = windows ? '$(cygpath -u "$2")' : '$2';
+  // Use the test runner's JS executable as a stand-in so the launcher
+  // fixtures do not require a second runtime on the test host.
+  const result = shell(`set -eu\nSTAGE="${convert}"\nBUN_BIN="${runtime}"\nOSFAM="$3"\n${launcherRecipe}`, [bundle, process.execPath, osfam]);
   expect(result.status, result.stderr || String(result.error)).toBe(0);
   return { root, bundle };
 }
 
 function invoke(bundle: string, command: string, args: string[] = [], extraEnv: NodeJS.ProcessEnv = {}, input?: string) {
   const convert = windows ? '$(cygpath -u "$1")' : '$1';
-  // Exclude system Node: execution must use the runtime in the bundle.
+  // No host Bun on this PATH: execution must use the runtime in the bundle.
   return shell(`STAGE="${convert}"\nshift\nPATH="$STAGE/bin:/usr/bin:/bin"\nexport PATH\n${command}`,
     [bundle, ...args], extraEnv, input);
 }
@@ -64,9 +66,9 @@ function checkForwarding(bundle: string) {
   expect(result.status, result.stderr).toBe(23);
   const output = JSON.parse(result.stdout);
   expect(output.args).toEqual(args);
-  expect(output.flags).toEqual(['--liftoff-only', '--disable-warning=ExperimentalWarning', '--max-semi-space-size=16']);
+  expect(output.flags).toEqual([]);
   expect(output.host).toBe('12345');
-  expect(fs.realpathSync(output.exe)).toBe(fs.realpathSync(path.join(bundle, windows ? 'node.exe' : 'node')));
+  expect(fs.realpathSync(output.exe)).toBe(fs.realpathSync(path.join(bundle, windows ? 'bun.exe' : 'bun')));
 }
 
 afterEach(() => {
@@ -74,12 +76,26 @@ afterEach(() => {
 });
 
 describe('bundled launchers (#1278)', () => {
-  it.runIf(!windows)('preserves POSIX arguments, exit status, runtime flags and host PID', () => {
+  it.runIf(!windows)('preserves POSIX arguments, exit status and host PID without V8 flags', () => {
     checkForwarding(stage().bundle);
   });
 
-  it.runIf(windows)('runs from Git Bash in a spaced path and forwards arguments, exit status, flags and host PID', () => {
+  it.runIf(windows)('forwards Git Bash arguments, exit status and host PID from a spaced path without V8 flags', () => {
     checkForwarding(stage().bundle);
+  });
+
+  it.runIf(!windows)('resolves chained symlinks and supplies the parent PID when none is inherited', () => {
+    const { root, bundle } = stage();
+    probe(bundle);
+    fs.symlinkSync(path.join(bundle, 'bin/codegraph'), path.join(root, 'absolute-link'));
+    fs.symlinkSync('absolute-link', path.join(root, 'relative-link'));
+    const result = shell(`unset CODEGRAPH_HOST_PPID
+printf '%s\\n' "$$"
+"$1"
+exit "$?"`, [path.join(root, 'relative-link')]);
+    expect(result.status, result.stderr).toBe(23);
+    const [parent, output] = result.stdout.trim().split('\n');
+    expect(JSON.parse(output).host).toBe(parent);
   });
 
   it.runIf(windows)('runs the real CLI and prompt hook in Git Bash, and keeps cmd and PowerShell working', () => {
@@ -118,56 +134,70 @@ describe('bundled launchers (#1278)', () => {
     const list = spawnSync('unzip', ['-Z1', path.join(root, 'release', `codegraph-${target}.zip`)], { encoding: 'utf8' });
     expect(list.status, list.stderr).toBe(0);
     const entries = list.stdout.split('\n');
-    for (const file of ['bin/codegraph', 'bin/codegraph.cmd', 'node.exe']) {
+    for (const file of ['bin/codegraph', 'bin/codegraph.cmd', 'bun.exe']) {
       expect(entries).toContain(`codegraph-${target}/${file}`);
     }
+    const cmd = fs.readFileSync(path.join(root, `codegraph-${target}`, 'bin/codegraph.cmd'), 'utf8');
+    expect(cmd).toBe('@"%~dp0..\\bun.exe" "%~dp0..\\lib\\dist\\bin\\codegraph.js" %*\r\n');
   });
 });
 
-describe('bundled Node runtime (#2617)', () => {
-  it('ships a Node 24 release with the fix for the Windows abort at exit', () => {
+describe('bundled Bun runtime', () => {
+  it('pins the bundled runtime and the release build host to the same Bun version, at least 1.4.4', () => {
     // The release workflow passes only the target, so the recipe's default
-    // version is the Node every release bundles.
+    // version is the Bun every release bundles.
     const workflow = fs.readFileSync(path.resolve('.github/workflows/release.yml'), 'utf8');
-    const calls = workflow.match(/build-bundle\.sh[^\r\n]*/g) ?? [];
+    const calls = [...workflow.matchAll(/^\s*bash scripts\/(build-bundle\.sh[^\r\n]*)/gm)];
     expect(calls.length).toBeGreaterThan(0);
-    for (const call of calls) expect(call.trim()).toBe('build-bundle.sh "$t"');
+    for (const [, command] of calls) expect(command.trim()).toBe('build-bundle.sh "$t"');
 
-    const pin = /^NODE_VERSION="\$\{2:-v(\d+)\.(\d+)\.(\d+)\}"\r?$/m.exec(recipe);
-    expect(pin, 'default NODE_VERSION in scripts/build-bundle.sh').not.toBeNull();
-    const [major, minor] = pin!.slice(1, 3).map(Number);
-    // The CLI refuses to run on Node 25 and later.
-    expect(major).toBe(24);
-    // Node 24 before 24.20.0 can abort on Windows as the process exits, after
-    // the command's work is done (0xC0000409, nodejs/node#56645).
-    expect(minor).toBeGreaterThanOrEqual(20);
+    const pin = /^BUN_VERSION="\$\{2:-((\d+)\.(\d+)\.(\d+))\}"\r?$/m.exec(recipe);
+    if (!pin) throw new Error('Missing default BUN_VERSION in scripts/build-bundle.sh');
+    const [, version, ...parts] = pin;
+    const [major, minor, patch] = parts.map(Number);
+    expect(major > 1 || (major === 1 && (minor > 4 || (minor === 4 && patch >= 4)))).toBe(true);
+    expect(workflow).toMatch(new RegExp(`^\\s+bun-version: ${version.replace(/\./g, '\\.')}\\s*$`, 'm'));
   });
 });
 
-describe('bundled Node security release (#2780)', () => {
-  const archive = 'node-v24.22.1-linux-x64.tar.gz';
+describe('bundled Bun integrity (#2780)', () => {
+  const targets = [
+    ['darwin-arm64', 'bun-darwin-aarch64', 'bun'],
+    ['darwin-x64', 'bun-darwin-x64-baseline', 'bun'],
+    ['linux-arm64', 'bun-linux-aarch64', 'bun'],
+    ['linux-x64', 'bun-linux-x64-baseline', 'bun'],
+    ['win32-arm64', 'bun-windows-aarch64', 'bun.exe'],
+    ['win32-x64', 'bun-windows-x64-baseline', 'bun.exe'],
+  ] as const;
+  const release = 'https://github.com/oven-sh/bun/releases/download/bun-v1.4.4';
 
-  // Step 1 of the release recipe, run against a stand-in for nodejs.org: `curl`
-  // copies the requested file out of `site/` and logs the URL it was asked for.
-  function download(sums: (sha: string) => string) {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-node-download-'));
+  // Replace only the remote service. The recipe still chooses the URL, verifies
+  // the checksum, and unpacks a real ZIP with the upstream layout.
+  function download([target, dist, runtime]: typeof targets[number], sums: (sha: string, archive: string) => string | undefined) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-bun-download-'));
     roots.push(root);
     const site = path.join(root, 'site');
     const work = path.join(root, 'work');
-    fs.mkdirSync(path.join(site, 'node-v24.22.1-linux-x64', 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(site, dist), { recursive: true });
     fs.mkdirSync(work);
-    fs.writeFileSync(path.join(site, 'node-v24.22.1-linux-x64', 'bin', 'node'), '#!/bin/sh\n');
+    fs.writeFileSync(path.join(site, dist, runtime), '#!/bin/sh\n');
+    const archive = `${dist}.zip`;
     const arg = (n: number) => windows ? `$(cygpath -u "$${n}")` : `$${n}`;
-    // Packed the way nodejs.org packs a release: one top-level folder.
-    const pack = shell(`set -eu\ncd "${arg(1)}"\ntar -czf ${archive} node-v24.22.1-linux-x64`, [site]);
+    const pack = windows
+      ? spawnSync('powershell.exe', ['-NoProfile', '-Command',
+          'Compress-Archive -LiteralPath $env:FIXTURE_DIR -DestinationPath $env:FIXTURE_ZIP'], {
+          encoding: 'utf8', env: { ...env, FIXTURE_DIR: path.join(site, dist), FIXTURE_ZIP: path.join(site, archive) },
+        })
+      : shell('set -eu\ncd "$1"\nzip -qr "$2" "$3"', [site, archive, dist]);
     expect(pack.status, pack.stderr).toBe(0);
     const sha = crypto.createHash('sha256').update(fs.readFileSync(path.join(site, archive))).digest('hex');
-    fs.writeFileSync(path.join(site, 'SHASUMS256.txt'), sums(sha));
+    const published = sums(sha, archive);
+    if (published !== undefined) fs.writeFileSync(path.join(site, 'SHASUMS256.txt'), published);
     const step = recipe.slice(recipe.indexOf('# 1. Download'), recipe.indexOf('# 2. Build'));
     const result = shell(`set -euo pipefail
 WORK="${arg(1)}"
 SITE="${arg(2)}"
-TARGET=linux-x64 OSFAM=linux ARCH=x64 NODE_VERSION=v24.22.1
+TARGET="$3" OSFAM="\${3%-*}" BUN_VERSION=1.4.4
 curl() {
   local url='' out=''
   while [ $# -gt 0 ]; do
@@ -177,42 +207,39 @@ curl() {
   cp "$SITE/\${url##*/}" "$out"
 }
 ${step}
-printf 'NODE_BIN=%s\\n' "$NODE_BIN"`, [work, site]);
+printf 'BUN_BIN=%s\\n' "$BUN_BIN"`, [work, site, target]);
     const urls = fs.existsSync(path.join(work, 'urls'))
       ? fs.readFileSync(path.join(work, 'urls'), 'utf8').trim().split('\n')
       : [];
     return { result, work, urls };
   }
 
-  it('ships Node 24.22.1, the October 2026 security release, or a later 24.x', () => {
-    const pin = /^NODE_VERSION="\$\{2:-v(\d+)\.(\d+)\.(\d+)\}"\r?$/m.exec(recipe);
-    expect(pin, 'default NODE_VERSION in scripts/build-bundle.sh').not.toBeNull();
-    const [major, minor, patch] = pin!.slice(1, 4).map(Number);
-    expect(major).toBe(24);
-    // 24.22.1 fixes eight CVEs (four rated High) and ships OpenSSL 3.5.9.
-    expect(minor > 22 || (minor === 22 && patch >= 1), `v${major}.${minor}.${patch}`).toBe(true);
-  });
-
-  it('unpacks the Node download once it matches the SHA-256 nodejs.org publishes for it', () => {
-    const other = 'f'.repeat(64);
-    const { result, work, urls } = download((sha) =>
-      `${other}  node-v24.22.1-darwin-arm64.tar.gz\n${sha}  ${archive}\n${other}  node-v24.22.1-win-x64.zip\n`);
+  it.each(targets)('verifies and unpacks the official %s runtime', (target, dist, runtime) => {
+    const { result, work, urls } = download([target, dist, runtime], (sha, archive) =>
+      `${'f'.repeat(64)}  ${dist}-profile.zip\n${sha}  ${archive}\n`);
     expect(result.status, result.stderr).toBe(0);
     expect(urls).toEqual([
-      `https://nodejs.org/dist/v24.22.1/${archive}`,
-      'https://nodejs.org/dist/v24.22.1/SHASUMS256.txt',
+      `${release}/${dist}.zip`,
+      `${release}/SHASUMS256.txt`,
     ]);
-    expect(fs.existsSync(path.join(work, 'node-v24.22.1-linux-x64', 'bin', 'node'))).toBe(true);
-    expect(result.stdout).toMatch(/^NODE_BIN=.*node-v24\.22\.1-linux-x64\/bin\/node\r?$/m);
+    expect(fs.existsSync(path.join(work, dist, runtime))).toBe(true);
+    expect(result.stdout.trim().split(/\r?\n/).pop()).toMatch(`/${dist}/${runtime}`);
   });
 
-  it.each([
-    ['whose SHA-256 differs from the published one', () => `${'0'.repeat(64)}  ${archive}\n`],
-    ['that the published list leaves out', (sha: string) => `${sha}  node-v24.22.1-linux-arm64.tar.gz\n`],
-  ])('refuses a Node download %s, before unpacking it', (_, sums) => {
-    const { result, work } = download(sums);
+  const invalidSums: [string, (sha: string, archive: string) => string | undefined][] = [
+    ['wrong digest', (_, archive) => `${'0'.repeat(64)}  ${archive}\n`],
+    ['missing entry', (sha) => `${sha}  bun-linux-aarch64.zip\n`],
+    ['malformed digest', (_, archive) => `not-hex  ${archive}\n`],
+    ['duplicate entries', (sha, archive) => `${sha}  ${archive}\n${sha}  ${archive}\n`],
+    ['missing checksum asset', () => undefined],
+  ];
+  it.each(invalidSums)('refuses to unpack a Bun download with %s', (_, sums) => {
+    const fixture = targets[3];
+    const { result, work, urls } = download(fixture, sums);
+    const archive = `${fixture[1]}.zip`;
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain(`${archive} does not match the SHA-256 that nodejs.org lists for v24.22.1`);
-    expect(fs.existsSync(path.join(work, 'node-v24.22.1-linux-x64'))).toBe(false);
+    expect(urls).toEqual([`${release}/${archive}`, `${release}/SHASUMS256.txt`]);
+    expect(fs.existsSync(path.join(work, archive))).toBe(true);
+    expect(fs.existsSync(path.join(work, fixture[1]))).toBe(false);
   });
 });

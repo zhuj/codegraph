@@ -1,0 +1,6 @@
+/.cache/
+/.materialized/
+/.config.yaml
+/.object-mcp-lock.sqlite*
+/.object-mcp-recovery/
+/.object-mcp-operations/
