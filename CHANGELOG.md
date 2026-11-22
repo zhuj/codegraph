@@ -26,6 +26,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Go indexing avoids checking unrelated types when linking interfaces and batches receiver lookups for methods declared in separate files.
 - Sync keeps indexed results when it cannot verify a source file or directory because of a filesystem error.
 - Sync reads stored file metadata in small batches and avoids reopening files whose timestamps changed without a content change.
 - Animated progress refreshes paths, counts, and phases only when its animation advances, keeping terminal output calm during fast scanning and indexing.

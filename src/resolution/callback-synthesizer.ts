@@ -1420,22 +1420,54 @@ async function goImplementsEdges(queries: QueryBuilder, ctx: ResolutionContext, 
     return true;
   };
 
-  // A type without a method, or an embedded type nothing describes, satisfies
-  // no interface this pass looks at.
-  const candidates: Node[] = [];
-  const candidateMethods = new Map<string, GoMethodNames>();
+  // Only index keys an interface actually needs, and only retain a full list
+  // for interfaces whose requirements are entirely opaque.
+  type Candidate = { readonly type: Node; readonly have: GoMethodNames };
+  const postings = new Map<string, Candidate[]>();
+  const requirements: { readonly iface: Node; readonly want: GoMethodNames }[] = [];
+  const opaqueCandidates: Candidate[] = [];
+  let needsOpaqueCandidates = false;
+  for (const iface of goInterfaces) {
+    if ((requirements.length & 63) === 63) await onYield();
+    const want = methodNames(iface.id);
+    requirements.push({ iface, want });
+    for (const key of want.methods) if (!postings.has(key)) postings.set(key, []);
+    if (want.methods.size === 0 && want.opaque.size > 0) needsOpaqueCandidates = true;
+  }
+
+  // Appending in canonical type order preserves both the cap's winners and
+  // the order in which the opaque fallback sees otherwise covering types.
+  const onlyPosting = postings.size === 1 ? postings.entries().next().value : undefined;
   for (const s of goImplementers) {
     if ((++scanned255 & 63) === 0) await onYield();
     const have = methodNames(s.id);
     if (have.methods.size + have.opaque.size === 0) continue;
-    candidates.push(s);
-    candidateMethods.set(s.id, have);
+    let candidate = needsOpaqueCandidates ? { type: s, have } : undefined;
+    if (candidate) opaqueCandidates.push(candidate);
+    if (onlyPosting) {
+      const [key, posting] = onlyPosting;
+      if (have.methods.has(key)) posting.push(candidate ?? { type: s, have });
+    } else if (postings.size > 0) {
+      for (const key of have.methods) {
+        const posting = postings.get(key);
+        if (posting) posting.push(candidate ??= { type: s, have });
+      }
+    }
   }
 
-  for (const iface of goInterfaces) {
+  const noCandidates: readonly Candidate[] = [];
+  for (const { iface, want } of requirements) {
     if ((++scanned255 & 63) === 0) await onYield();
-    const want = methodNames(iface.id);
     if (want.methods.size + want.opaque.size === 0) continue; // empty interface (`any`) — would match everything
+    let shortest: readonly Candidate[] | undefined;
+    for (const key of want.methods) {
+      const posting = postings.get(key);
+      if (!posting?.length) {
+        shortest = noCandidates;
+        break;
+      }
+      if (!shortest || posting.length < shortest.length) shortest = posting;
+    }
     let added = 0;
     const link = (s: Node): void => {
       const key = `${s.id}>${iface.id}`;
@@ -1462,10 +1494,9 @@ async function goImplementsEdges(queries: QueryBuilder, ctx: ResolutionContext, 
     let wanted: Map<string, Set<string> | null> | undefined;
     let covering = 0;
     let sole: Node | undefined;
-    for (const s of candidates) {
+    for (const { type: s, have } of shortest ?? opaqueCandidates) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
-      const have = candidateMethods.get(s.id)!;
-      if (!covers(have.methods, want.methods)) continue;
+      if (want.methods.size > 1 && !covers(have.methods, want.methods)) continue;
       if (!wanted) wanted = wantedArities(iface);
       if (!aritiesFit(s.id, wanted) || !typesFit(s, iface)) continue;
       covering++;
@@ -1519,42 +1550,65 @@ async function goCrossFileMethodContainsEdges(queries: QueryBuilder, onYield: Ma
     return i >= 0 ? p.slice(0, i) : '';
   };
 
+  type ReceiverMethod = { readonly method: Node; readonly receiver: string };
+  const BATCH_SIZE = 256;
+  const batch: ReceiverMethod[] = [];
+  let ownerLookups = 0;
+  const attachBatch = async (): Promise<void> => {
+    const incoming = queries.getIncomingEdgesTo(batch.map(({ method }) => method.id), ['contains']);
+    const parents = queries.getNodesByIds([...new Set(incoming.map(e => e.source))]);
+    const attached = new Set<string>();
+    for (const { source, target } of incoming) {
+      const parent = parents.get(source);
+      if (parent && TYPE_KINDS.has(parent.kind)) attached.add(target);
+    }
+
+    // A globally common name can occur in many packages. Decode its rows once
+    // per batch, keeping only the first Go type in each requested directory.
+    const ownersByReceiver = new Map<string, Map<string, Node | undefined>>();
+    const orphans: { readonly method: Node; readonly dir: string; readonly owners: Map<string, Node | undefined> }[] = [];
+    for (const { method, receiver } of batch) {
+      if (attached.has(method.id)) continue;
+      const dir = dirOf(method.filePath);
+      let owners = ownersByReceiver.get(receiver);
+      if (!owners) ownersByReceiver.set(receiver, (owners = new Map()));
+      owners.set(dir, undefined);
+      orphans.push({ method, dir, owners });
+    }
+    for (const [receiver, owners] of ownersByReceiver) {
+      if ((++ownerLookups & 63) === 0) await onYield();
+      let remaining = owners.size;
+      for (const n of queries.getNodesByName(receiver)) {
+        if (n.language !== 'go' || !TYPE_KINDS.has(n.kind)) continue;
+        const dir = dirOf(n.filePath);
+        if (!owners.has(dir) || owners.get(dir)) continue;
+        owners.set(dir, n);
+        if (--remaining === 0) break;
+      }
+    }
+    for (const { method, dir, owners } of orphans) {
+      const owner = owners.get(dir);
+      if (!owner) continue;
+      const key = `${owner.id}>${method.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({ source: owner.id, target: method.id, kind: 'contains', line: method.startLine,
+        metadata: { synthesizedBy: 'go-method-contains' } });
+    }
+    batch.length = 0;
+  };
+
   for (const method of queries.iterateNodesByKindIn('method', ['go'])) {
     if ((++scanned255 & 63) === 0) await onYield();
-    // The receiver type is encoded in the method's qualifiedName as `Recv::name`
-    // (extraction sets `${receiverType}::${name}` for receiver methods).
+    // Extraction writes receiver methods as `Recv::name`.
     const qn = method.qualifiedName;
     if (!qn) continue;
     const sep = qn.lastIndexOf('::');
     if (sep <= 0) continue;
-    const receiver = qn.slice(0, sep);
-    if (!receiver) continue;
-
-    // Already attached to its type (same-file case handled at extraction)?
-    const hasTypeParent = queries
-      .getIncomingEdges(method.id, ['contains'])
-      .some((e) => {
-        const src = queries.getNodeById(e.source);
-        return src != null && TYPE_KINDS.has(src.kind);
-      });
-    if (hasTypeParent) continue;
-
-    // Find the receiver type in the SAME directory (= same Go package). Go forbids
-    // duplicate type names within a package, so a same-name same-dir match is
-    // unambiguous; scoping to the directory avoids linking to a same-named type
-    // in another package.
-    const dir = dirOf(method.filePath);
-    const owner = queries
-      .getNodesByName(receiver)
-      .find((n) => n.language === 'go' && TYPE_KINDS.has(n.kind) && dirOf(n.filePath) === dir);
-    if (!owner) continue;
-
-    const key = `${owner.id}>${method.id}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    edges.push({ source: owner.id, target: method.id, kind: 'contains', line: method.startLine,
-      metadata: { synthesizedBy: 'go-method-contains' } });
+    batch.push({ method, receiver: qn.slice(0, sep) });
+    if (batch.length === BATCH_SIZE) await attachBatch();
   }
+  if (batch.length > 0) await attachBatch();
   return edges;
 }
 
