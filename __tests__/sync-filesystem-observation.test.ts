@@ -21,7 +21,7 @@ vi.mock('fs', async (importOriginal) => {
 
 vi.mock('fs/promises', async (importOriginal) => {
   const fsp = await importOriginal<typeof import('fs/promises')>();
-  return { ...fsp, stat: vi.fn(fsp.stat) };
+  return { ...fsp, open: vi.fn(fsp.open), stat: vi.fn(fsp.stat) };
 });
 
 function gate() {
@@ -364,6 +364,134 @@ describe('sync filesystem reconciliation', () => {
     await expect(sync).rejects.toThrow(/source root/i);
     expect(queries.getFileByPath(file)).toEqual(before);
     expect(nodeIds()).toEqual(nodes);
+  });
+
+  it('reads a stable changed file once for classification and extraction', async () => {
+    fs.writeFileSync(source, 'export function changedOnDisk() { return 42; }\n');
+    const realSource = fs.realpathSync(source);
+    const syncOpens = vi.mocked(fs.openSync);
+    const asyncOpens = vi.mocked(fsp.open);
+    syncOpens.mockClear();
+    asyncOpens.mockClear();
+
+    const countSourceOpens = () => [...syncOpens.mock.calls, ...asyncOpens.mock.calls]
+      .filter(([name]) => name === source || name === realSource).length;
+    let opensAtClassification = 0;
+    let opensBeforeParsing = 0;
+    const result = await extraction.sync((progress) => {
+      if (progress.phase === 'parsing' && progress.currentFile === file) opensBeforeParsing = countSourceOpens();
+    }, undefined, undefined, (changed) => {
+      if (changed === file) opensAtClassification = countSourceOpens();
+    });
+
+    expect(result.changedFilePaths).toEqual([file]);
+    expect(queries.getNodesByFiles([file]).map((node) => node.name)).toContain('changedOnDisk');
+    expect(opensAtClassification).toBe(1);
+    // Independent framework detection can read the same source between these phases.
+    expect(countSourceOpens() - opensBeforeParsing).toBe(0);
+  });
+
+  it('rereads the changed source that does not fit the snapshot budget', async () => {
+    const realRoot = fs.realpathSync(root);
+    const fixtures = ['header', 'payload', 'checksum', 'footer', 'envelope'].map((field) => {
+      const filePath = `src/${field}.ts`;
+      const fullPath = path.join(root, filePath);
+      fs.writeFileSync(fullPath, `export function ${field}() { return 1; }\n`);
+      return { filePath, fullPath, realPath: path.join(realRoot, filePath), name: `read_${field}` };
+    });
+    await extraction.sync();
+
+    // Individually these documented modules fit the source-file size limit;
+    // the decoded text fits the sync budget for four modules, but not five.
+    const documentation = ' * Describes how a server validates and normalizes a protocol field.\n'.repeat(13_500);
+    for (const { fullPath, name } of fixtures) {
+      fs.writeFileSync(fullPath, `/**\n${documentation} */\nexport function ${name}() { return 2; }\n`);
+    }
+    const countOpens = ({ fullPath, realPath }: typeof fixtures[number]) => [
+      ...vi.mocked(fs.openSync).mock.calls, ...vi.mocked(fsp.open).mock.calls,
+    ].filter(([name]) => name === fullPath || name === realPath).length;
+    let beforeParsing: number[] = [];
+    const result = await extraction.sync(({ phase, current }) => {
+      if (phase === 'parsing' && current === 1) beforeParsing = fixtures.map(countOpens);
+    });
+
+    expect(result.filesModified).toBe(fixtures.length);
+    expect(result.failedFilePaths).toBeUndefined();
+    expect(beforeParsing).toHaveLength(fixtures.length);
+    const parsingOpens = fixtures.map((fixture, index) => countOpens(fixture) - (beforeParsing[index] ?? 0));
+    // Discovery order may decide which file overflows, not how many do.
+    expect(parsingOpens.sort()).toEqual([0, 0, 0, 0, 1]);
+    for (const { filePath, name } of fixtures) {
+      expect(queries.getNodesByFiles([filePath]).map((node) => node.name)).toContain(name);
+    }
+  });
+
+  it.each(['in-place edit', 'replacement'])('rereads a classified snapshot after an %s', async (change) => {
+    fs.writeFileSync(source, 'export function classified() {}\n');
+    const classifiedTime = new Date('2020-01-01T00:00:00Z');
+    fs.utimesSync(source, classifiedTime, classifiedTime);
+
+    const result = await extraction.sync((progress) => {
+      if (progress.phase !== 'parsing' || progress.currentFile !== file) return;
+      const edited = change === 'replacement' ? `${source}.replacement` : source;
+      fs.writeFileSync(edited, 'export function currentOne() {}\n');
+      if (edited !== source) {
+        // A replacement with the same size and mtime must still be detected.
+        fs.utimesSync(edited, classifiedTime, classifiedTime);
+        fs.renameSync(edited, source);
+      }
+    });
+
+    expect(result.failedFilePaths).toBeUndefined();
+    const names = queries.getNodesByFiles([file]).map((node) => node.name);
+    expect(names).toContain('currentOne');
+    expect(names).not.toContain('classified');
+  });
+
+  it('preserves the indexed file and requests a retry when it vanishes after classification', async () => {
+    const before = queries.getFileByPath(file);
+    fs.writeFileSync(source, 'export function noLongerOnDisk() {}\n');
+
+    const result = await extraction.sync((progress) => {
+      if (progress.phase === 'parsing' && progress.currentFile === file) fs.unlinkSync(source);
+    });
+
+    expect(result.failedFilePaths).toEqual([file]);
+    expect(queries.getFileByPath(file)).toEqual(before);
+    const retry = await extraction.sync();
+    expect(retry.removedFilePaths).toEqual([file]);
+    expect(queries.getFileByPath(file)).toBeNull();
+  });
+
+  it('preserves the indexed file and requests a retry when its source becomes unreadable', async () => {
+    const before = queries.getFileByPath(file);
+    fs.writeFileSync(source, 'export function eventuallyReadable() {}\n');
+    const realSource = fs.realpathSync(source);
+    const { statSync } = await vi.importActual<typeof fs>('fs');
+    const { open } = await vi.importActual<typeof fsp>('fs/promises');
+    const syncStat = vi.mocked(fs.statSync);
+    const asyncOpen = vi.mocked(fsp.open);
+
+    const result = await extraction.sync((progress) => {
+      if (progress.phase !== 'parsing' || progress.currentFile !== file) return;
+      const error = Object.assign(new Error('Injected read failure'), { code: 'EIO' });
+      syncStat.mockImplementation(((...args: Parameters<typeof statSync>) => {
+        if (args[0] === source || args[0] === realSource) throw error;
+        return statSync(...args);
+      }) as typeof statSync);
+      asyncOpen.mockImplementation(async (...args: Parameters<typeof open>) => {
+        if (args[0] === realSource) throw error;
+        return open(...args);
+      });
+    });
+
+    expect(result.failedFilePaths).toEqual([file]);
+    expect(queries.getFileByPath(file)).toEqual(before);
+    syncStat.mockReset();
+    asyncOpen.mockReset();
+    const retry = await extraction.sync();
+    expect(retry.failedFilePaths).toBeUndefined();
+    expect(queries.getNodesByFiles([file]).map((node) => node.name)).toContain('eventuallyReadable');
   });
 
   it('does not reread touched-identical bytes on the next sync or clear recorded errors', async () => {

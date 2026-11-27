@@ -21,7 +21,9 @@ import {
 } from '../types';
 import { QueryBuilder, NodeIdentity } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
+import { EXTRACTION_VERSION } from './extraction-version';
 import { ParseWorkerPool, parseWindowSize, resolveParsePoolSize, resolveParseTimeoutMs } from './parse-pool';
+import { readAheadInOrder } from './ordered-read-ahead';
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
@@ -226,13 +228,38 @@ function readSourceOrStamp(fullPath: string): string | null {
   return sourceOrStamp(fullPath, readBoundedSourceSync(fullPath));
 }
 
+function sameSourceStat(before: fs.Stats, after: fs.Stats): boolean {
+  return before.size === after.size && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs &&
+    before.dev === after.dev && before.ino === after.ino && before.mode === after.mode;
+}
+
 function stableTouch(previous: FileRecord, observed: fs.Stats, { stats, bytes }: BoundedSource): boolean {
   // The ending descriptor stat must describe what reconciliation saw, not a
   // later edit or replacement. A size-only stamp is not evidence of equal bytes.
   return bytes !== null && bytes.length === stats.size && stats.size === previous.size &&
-    observed.size === stats.size && observed.mtimeMs === stats.mtimeMs && observed.ctimeMs === stats.ctimeMs &&
-    observed.dev === stats.dev && observed.ino === stats.ino && previous.modifiedAt !== stats.mtimeMs;
+    sameSourceStat(observed, stats) && previous.modifiedAt !== stats.mtimeMs;
 }
+
+interface SourceContent {
+  readonly content: string;
+  readonly stats: fs.Stats;
+  readonly contentHash?: string;
+}
+
+interface SyncSourceSnapshot extends SourceContent {
+  readonly contentHash: string;
+}
+
+interface SyncPreparedParse {
+  readonly language: Language;
+  readonly frameworkNames: readonly string[];
+  readonly result: ExtractionResult;
+}
+
+// A large checkout still classifies every path before changing the graph.
+// Limit how much decoded source can live across that boundary.
+const SYNC_SOURCE_CACHE_BYTES = 8 * MAX_SOURCE_FILE_SIZE_BYTES;
+const SYNC_SOURCE_ENTRY_BYTES = 512;
 
 function needsZeroNodeRepair(file: FileRecord): boolean {
   // Error rows are deliberate skips (#1557), not the wiped, error-free
@@ -2640,12 +2667,14 @@ export class ExtractionOrchestrator {
     // between-transactions boundary) when the WAL has outrun the off-thread
     // checkpointer past its hard cap. See db/wal-valve.ts.
     walBackpressure?: () => Promise<void> | null,
-    // Fresh-DB store offload (perf): when set, per-file store bundles are
-    // applied by a dedicated writer thread instead of the main thread. Only
-    // passed for a COMPLETELY fresh database, where the main thread performs
-    // no reads/writes during the parse loop, so one writer applying bundles
-    // in file order preserves the #1015 determinism exactly.
-    storeWriterOpts?: { dbPath: string; fastInit: boolean } | null
+    load?: {
+      reusableInputs: string | null;
+      // A dedicated writer can commit in file order (#1015) on a fresh DB,
+      // where the main thread performs no DB work during the parse loop.
+      storeWriter?: { dbPath: string; fastInit: boolean };
+      beginBulkRewrite: () => void;
+      onExtractionComplete: (stamp: string) => void;
+    }
   ): Promise<IndexResult> {
     const tGrammar = Date.now();
     await initGrammars();
@@ -2703,11 +2732,6 @@ export class ExtractionOrchestrator {
     };
 
 
-    // A re-index over an existing DB skips unchanged-hash files at the store,
-    // which would preserve wiped zero-node rows (#1541) — drop them first so
-    // this run stores their files fresh. No-op on a fresh DB.
-    this.healZeroNodeRows();
-
     // Detect frameworks once per indexAll run using the scanned file list.
     // Names are passed to each parse call so framework-specific extractors
     // (route nodes, middleware, etc.) run after the tree-sitter pass.
@@ -2733,13 +2757,46 @@ export class ExtractionOrchestrator {
       };
     }
 
+    // The resolver's framework inventory can differ from extraction's. Even
+    // with identical detected names, a changed package manifest can enable
+    // or disable framework-specific nodes in a particular app directory.
+    const frameworkGates: Array<[string, string[]]> = [];
+    if (this.gatedFrameworks.size > 0) {
+      for (const file of files) this.frameworksForFile(file, frameworkNames);
+      // Record what the app gates actually consulted, not every source
+      // directory. Adding a source directory without a manifest is compatible.
+      for (const [dir, declared] of this.manifestDependencies) {
+        const names = [...this.gatedFrameworks].filter(([, deps]) => deps.some((dep) => declared?.has(dep))).map(([name]) => name);
+        if (names.length > 0) frameworkGates.push([dir, names]);
+      }
+    }
+    const extractionStamp = hashContent(JSON.stringify({
+      version: EXTRACTION_VERSION,
+      scope: scopeFingerprint,
+      overrides: Object.entries(overrides).sort(),
+      frameworks: frameworkNames,
+      frameworkGates: frameworkGates.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0),
+    }));
+    const stampPrefix = `${extractionStamp}:`;
+    const cutoff = Number(load?.reusableInputs?.slice(stampPrefix.length));
+    const rewrite = !load?.reusableInputs?.startsWith(stampPrefix) ||
+      !Number.isSafeInteger(cutoff) || cutoff <= 0 || cutoff > Date.now();
+    if (rewrite) load?.beginBulkRewrite();
+
+    // Matching hashes must not preserve wiped zero-node rows (#1541).
+    this.healZeroNodeRows();
+
     // Re-indexing an existing workspace must remove rows whose directories
     // were deselected or excluded. Preserve surviving callers as unresolved
     // references, matching incremental sync's removal behavior.
     const scanFiles = new Set(files);
+    const reusableFiles = rewrite ? null : new Map<string, FileRecord>();
     for (const tracked of this.queries.getAllFiles()) {
-      if (scanFiles.has(tracked.path) && fs.existsSync(path.join(this.rootDir, tracked.path))) continue;
-      this.removeIndexedFile(tracked.path);
+      if (scanFiles.has(tracked.path) && fs.existsSync(path.join(this.rootDir, tracked.path))) {
+        reusableFiles?.set(tracked.path, tracked);
+      } else {
+        this.removeIndexedFile(tracked.path);
+      }
     }
 
     // Phase 2: Parse files in a worker thread (keeps main thread unblocked for UI)
@@ -2756,17 +2813,21 @@ export class ExtractionOrchestrator {
     });
     await new Promise(resolve => setImmediate(resolve));
 
-    // Detect needed languages and load grammars in the parse worker
-    const neededLanguages = preloadLanguagesForFiles(files, overrides, this.rootDir);
-
     // Parse files on a pool of worker threads (keeps the main thread free for UI
     // and uses every core). Falls back to in-process parsing when the compiled
     // worker is unavailable (e.g. running from source in tests).
     const parseWorkerPath = path.join(__dirname, 'parse-worker.js');
     const useWorker = fs.existsSync(parseWorkerPath);
 
-    let pool: ParseWorkerPool | null = null;
-    if (useWorker) {
+    const poolSize = useWorker
+      ? resolveParsePoolSize(process.env.CODEGRAPH_PARSE_WORKERS, Math.max(3, os.availableParallelism()))
+      : 1;
+    const prepareParser = async (): Promise<ParseWorkerPool | null> => {
+      const neededLanguages = preloadLanguagesForFiles(files, overrides, this.rootDir);
+      if (!useWorker) {
+        await loadGrammarsForLanguages(neededLanguages);
+        return null;
+      }
       // CODEGRAPH_PARSE_WORKERS: explicit worker count; 1 = the old single-worker
       // behaviour (the conservative rollback). Unset → clamp(cores-1, 1, 8),
       // with cores from availableParallelism — cpuset/affinity-honest, where
@@ -2776,13 +2837,12 @@ export class ExtractionOrchestrator {
       // parse is worker-side CPU, and 1 worker measured 34% slower than the
       // old oversubscribed pool on the kernel-scale 2-cpuset envelope
       // (493s vs 369s) — main + store-worker don't fill the second core.
-      const poolSize = resolveParsePoolSize(process.env.CODEGRAPH_PARSE_WORKERS, Math.max(3, os.availableParallelism()));
       // Read each needed grammar's WASM ONCE here and hand the bytes to every
       // worker, so spawns/respawns load grammars from memory instead of
       // re-reading them from disk (#1231: on an HDD, respawn re-reads amplify
       // the very I/O contention that caused the respawn).
       const grammarBuffers = await readGrammarWasmBytes(neededLanguages);
-      pool = new ParseWorkerPool({
+      const workerPool = new ParseWorkerPool({
         languages: neededLanguages,
         size: poolSize,
         // CODEGRAPH_PARSE_WORKERS names the pool outright; otherwise it starts at
@@ -2795,19 +2855,19 @@ export class ExtractionOrchestrator {
         grammarBuffers,
       });
       log(`Parse worker pool: up to ${poolSize} worker(s)`);
-      // Bulk index: spawn the workers this many files need now, so worker boot
-      // overlaps the first read batches instead of trickling in behind
-      // queue-pressure growth.
-      pool.prewarm();
-    } else {
-      // In-process fallback: load grammars locally and parse on the main thread.
-      await loadGrammarsForLanguages(neededLanguages);
-    }
+      // Full rewrite: overlap boot with the first read batches. In-place
+      // re-index: let queue pressure grow a single worker only as needed.
+      if (rewrite) workerPool.prewarm();
+      return workerPool;
+    };
+    let parserReady = rewrite;
+    let pool = rewrite ? await prepareParser() : null;
 
     // Dedicated store writer thread (fresh DB only — see the parameter doc).
     // Same availability rule as the parse pool: needs the compiled worker
     // (absent when running from source in tests → main-thread fallback).
     const storeWorkerPath = path.join(__dirname, 'store-worker.js');
+    const storeWriterOpts = load?.storeWriter;
     let storeWriter: StoreWriter | null = null;
     if (
       storeWriterOpts &&
@@ -2841,8 +2901,8 @@ export class ExtractionOrchestrator {
     };
 
     // --- Bounded rolling-window dispatch, ordered commit ---
-    // Reads stay batched/parallel; parses run concurrently across the pool; the
-    // SQLite store stays on the main thread (it isn't thread-safe). Crucially we
+    // Reads overlap parsing; parses run concurrently across the pool; the
+    // SQLite store has a single writer (local or dedicated). Crucially we
     // COMMIT results in original file order, not parse-completion order: the
     // resolution phase (run after indexing) resolves an ambiguous reference to one
     // of several same-named candidates by the nodes' DB insertion order, so a
@@ -2850,14 +2910,18 @@ export class ExtractionOrchestrator {
     // to the single-worker path — instead of drifting with parse timing. The
     // `completed` buffer holds at most ~windowSize out-of-order results, so memory
     // stays bounded.
-    const windowSize = pool ? parseWindowSize(pool.size) : 1;
+    const windowSize = useWorker ? parseWindowSize(poolSize) : 1;
     const inFlight = new Set<Promise<void>>();
     const completed = new Map<number,
-      | { ok: true; filePath: string; content: string; stats: fs.Stats; result: ExtractionResult }
-      | { ok: false; filePath: string; content: string; stats: fs.Stats; err: unknown }>();
+      | { ok: 'reused'; filePath: string }
+      | { ok: true; filePath: string; content: string; stats: fs.Stats; result: ExtractionResult; contentHash?: string }
+      | { ok: false; filePath: string; content: string; stats: fs.Stats; err: unknown; contentHash?: string }>();
     let nextSeq = 0;       // file-order sequence assigned at dispatch
     let nextToStore = 0;   // cursor: next sequence to commit
     let aborted = false;
+    const timing = process.env.CODEGRAPH_SYNTH_TIMINGS
+      ? { readMs: 0, readBytes: 0, parseResponseMs: 0, windowWaitMs: 0, writerWaitMs: 0 }
+      : undefined;
 
     // Yielder for the in-order commit path: a single giant generated file's
     // store is otherwise one unyielding multi-second transaction span on the
@@ -2865,7 +2929,13 @@ export class ExtractionOrchestrator {
     // the #850 watchdog heartbeat on slow hardware.
     const commitYield = createYielder();
 
-    const storeResult = async (filePath: string, content: string, stats: fs.Stats, result: ExtractionResult): Promise<void> => {
+    const forceStore = (filePath: string, language: Language, result: ExtractionResult): boolean => {
+      const previous = reusableFiles?.get(filePath);
+      return rewrite || (!!previous && (previous.language !== language ||
+        ((previous.indexedAt >= cutoff || !!previous.errors?.length) &&
+          !result.errors.some((e) => e.severity === 'error' || e.code === 'size_exceeded'))));
+    };
+    const storeResult = async (filePath: string, content: string, stats: fs.Stats, result: ExtractionResult, contentHash?: string): Promise<void> => {
       processed++;
 
       // WAL hard-cap backstop: between files (never mid-transaction), pause
@@ -2904,10 +2974,12 @@ export class ExtractionOrchestrator {
         } else {
           storeWriter.send(this.buildFreshStoreBundle(filePath, content, language, stats, result));
         }
+        const waitStarted = timing && performance.now();
         await storeWriter.waitBelow(STORE_WRITER_WINDOW);
+        if (timing && waitStarted !== undefined) timing.writerWaitMs += performance.now() - waitStarted;
       } else {
         const materialized = materializeKernelResult(result, filePath, language);
-        await this.storeExtractionResult(filePath, content, language, stats, materialized, commitYield);
+        await this.storeExtractionResult(filePath, content, language, stats, materialized, commitYield, contentHash, forceStore(filePath, language, materialized));
       }
 
       if (result.errors.length > 0) {
@@ -2940,19 +3012,10 @@ export class ExtractionOrchestrator {
       onProgress?.({ phase: 'parsing', current: processed, total, currentFile: filePath });
     };
 
-    const recordParseFailure = async (filePath: string, content: string, stats: fs.Stats, err: unknown): Promise<void> => {
-      await storeResult(filePath, content, stats, {
-        nodes: [],
-        edges: [],
-        unresolvedReferences: [],
-        errors: [{
-          message: err instanceof Error ? err.message : String(err),
-          filePath,
-          severity: 'error',
-          code: 'parse_error',
-        }],
-        durationMs: 0,
-      });
+    const reportReused = (filePath: string): void => {
+      // Count covered files, not extraction work the pipeline never did.
+      filesIndexed++;
+      onProgress?.({ phase: 'parsing', current: ++processed, total, currentFile: filePath });
     };
 
     // Commit buffered parses to the DB in file order, advancing the cursor over
@@ -2970,12 +3033,27 @@ export class ExtractionOrchestrator {
       flushChain = flushChain.then(async () => {
         if (aborted || flushError) return;
         try {
-          while (completed.has(nextToStore)) {
+          while (!signal?.aborted && completed.has(nextToStore)) {
             const item = completed.get(nextToStore)!;
             completed.delete(nextToStore);
             nextToStore++;
-            if (item.ok) await storeResult(item.filePath, item.content, item.stats, item.result);
-            else await recordParseFailure(item.filePath, item.content, item.stats, item.err);
+            if (item.ok === 'reused') {
+              reportReused(item.filePath);
+            } else {
+              const result: ExtractionResult = item.ok ? item.result : {
+                nodes: [],
+                edges: [],
+                unresolvedReferences: [],
+                errors: [{
+                  message: item.err instanceof Error ? item.err.message : String(item.err),
+                  filePath: item.filePath,
+                  severity: 'error',
+                  code: 'parse_error',
+                }],
+                durationMs: 0,
+              };
+              await storeResult(item.filePath, item.content, item.stats, result, item.contentHash);
+            }
           }
         } catch (err) {
           flushError = err;
@@ -2987,19 +3065,23 @@ export class ExtractionOrchestrator {
     // Dispatch one file's parse (parses run concurrently across the pool), tagged
     // with its file-order sequence so flushOrdered commits results in order. The
     // backpressure below bounds how far parsing runs ahead of the in-order commit.
-    const feed = async (filePath: string, content: string, stats: fs.Stats): Promise<void> => {
+    const feed = (filePath: string, content: string, stats: fs.Stats, contentHash?: string): void => {
       const seq = nextSeq++;
       const p = (async () => {
+        const parseStarted = timing && performance.now();
         try {
           const result = await parseFile(filePath, content);
-          completed.set(seq, { ok: true, filePath, content, stats, result });
+          completed.set(seq, { ok: true, filePath, content, stats, result, contentHash });
         } catch (parseErr) {
-          completed.set(seq, { ok: false, filePath, content, stats, err: parseErr });
+          completed.set(seq, { ok: false, filePath, content, stats, err: parseErr, contentHash });
         }
+        if (timing && parseStarted !== undefined) timing.parseResponseMs += performance.now() - parseStarted;
         flushOrdered();
       })();
       const tracked = p.finally(() => { inFlight.delete(tracked); });
       inFlight.add(tracked);
+    };
+    const waitForWindow = async (): Promise<void> => {
       // Backpressure on the dispatched-but-not-yet-committed count (in-flight +
       // buffered), not just in-flight: a slow file sitting at the commit cursor
       // lets later parses finish and buffer, which would otherwise grow without
@@ -3011,124 +3093,127 @@ export class ExtractionOrchestrator {
       // moves again — flushOrdered returns at once — so stop waiting and let
       // the drain below rethrow; waiting would spin on microtasks forever,
       // pinning a core and starving every timer in the process.
-      while (nextSeq - nextToStore >= windowSize && !flushError && !aborted) {
+      if (nextSeq - nextToStore < windowSize || flushError || signal?.aborted) return;
+      const waitStarted = timing && performance.now();
+      while (nextSeq - nextToStore >= windowSize && !flushError && !signal?.aborted) {
         if (inFlight.size > 0) await Promise.race(inFlight);
         else await flushOrdered();
+      }
+      if (timing && waitStarted !== undefined) timing.windowWaitMs += performance.now() - waitStarted;
+    };
+
+    const readSource = async (filePath: string) => {
+      const started = timing && performance.now();
+      try {
+        // Follow in-root symlinks the scanner descended into (#935); still reject '..' escapes.
+        const fullPath = validatePathWithinRoot(this.rootDir, filePath, { allowSymlinkEscape: true });
+        if (!fullPath) {
+          logWarn('Path traversal blocked in source reader', { filePath });
+          return { filePath, content: null, stats: null, error: new Error('Path traversal blocked') };
+        }
+        // Oversize files never read or decode their contents (#1910).
+        const { stats, bytes } = await readBoundedSource(fullPath);
+        if (timing) timing.readBytes += bytes?.byteLength ?? 0;
+        // An MPEG transport stream named '.ts' is not source (#1910).
+        if (bytes && isMpegTsBytes(filePath, bytes)) {
+          return { filePath, content: null, stats: null, skipped: true };
+        }
+        return { filePath, content: bytes === null ? oversizeStamp(stats.size) : bytes.toString('utf-8'), stats };
+      } catch (error) {
+        // Git can list a tracked path that has already vanished (#2904).
+        if (isMissingPathError(error)) return { filePath, content: null, stats: null, gone: true };
+        return { filePath, content: null, stats: null, error };
+      } finally {
+        if (timing && started !== undefined) timing.readMs += performance.now() - started;
       }
     };
 
     const tParseLoop = Date.now();
-    for (let i = 0; i < files.length; i += FILE_IO_BATCH_SIZE) {
-      if (signal?.aborted) { aborted = true; break; }
+    // With the per-file cap, the old I/O batch size is also a bound on total
+    // read-ahead source bytes. Refill while dispatch and ordered writes run.
+    const reads = readAheadInOrder(files, readSource, { maxReads: FILE_IO_BATCH_SIZE, signal });
+    for await (const { filePath, content, stats, error, skipped, gone } of reads) {
+      if (flushError || signal?.aborted) break;
 
-      const batch = files.slice(i, i + FILE_IO_BATCH_SIZE);
-
-      // Read files in parallel (with path validation before any I/O)
-      const fileContents = await Promise.all(
-        batch.map(async (fp) => {
-          try {
-            // Indexing read: follow in-root symlinks the directory walk already
-            // descended into (the `../` guard still applies) so files reached
-            // via an in-root symlink-to-outside still index (#935).
-            const fullPath = validatePathWithinRoot(this.rootDir, fp, { allowSymlinkEscape: true });
-            if (!fullPath) {
-              logWarn('Path traversal blocked in batch reader', { filePath: fp });
-              return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: new Error('Path traversal blocked') };
-            }
-            // Stat first: a file over the size limit is stored as skipped
-            // without ever being read or decoded (#1910), so ten oversize
-            // fixtures in one I/O batch no longer cost their size in RSS.
-            const { stats, bytes } = await readBoundedSource(fullPath);
-            if (bytes === null) {
-              return { filePath: fp, content: oversizeStamp(stats.size), stats, error: null as Error | null };
-            }
-            // Read bytes, not text: a `.ts` that is really an MPEG transport
-            // stream (#1910) is recognised from its head here, at no extra I/O,
-            // and never decoded or parsed.
-            if (isMpegTsBytes(fp, bytes)) {
-              return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: null as Error | null, skipped: true };
-            }
-            const content = bytes.toString('utf-8');
-            return { filePath: fp, content, stats, error: null as Error | null };
-          } catch (err) {
-            // Nothing at the path is not a file that could not be read (#2904):
-            // git keeps listing a tracked file deleted from the working tree
-            // until the deletion is staged, a symlink can point at nothing (the
-            // directory walk skips one quietly), and a file can go between the
-            // scan and this read. Skip it. EACCES, EIO and the like still report.
-            if (isMissingPathError(err)) {
-              return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: null as Error | null, gone: true };
-            }
-            return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: err as Error };
-          }
-        })
-      );
-
-      // Dispatch each readable file into the bounded parse window; the window
-      // stores results on the main thread as they arrive.
-      for (const { filePath, content, stats, error, skipped, gone } of fileContents) {
-        if (signal?.aborted) { aborted = true; break; }
-
-        if (skipped) {
-          // Not a source file after all — counted as done, stored as nothing.
-          // Counted as skipped too: the scan found it, and a file no tally
-          // holds reads as one the run lost, so the index was called PARTIAL.
-          processed++;
-          filesSkipped++;
-          onProgress?.({ phase: 'parsing', current: processed, total });
-          continue;
-        }
-
-        if (gone) {
-          // Listed by the scan but not on disk: skipped, stored as nothing. It
-          // still counts toward the tallies, or the run would read as PARTIAL.
-          processed++;
-          filesSkipped++;
-          onProgress?.({ phase: 'parsing', current: processed, total });
-          continue;
-        }
-
-        if (error || content === null || stats === null) {
-          processed++;
-          filesErrored++;
-          errors.push({
-            message: `Failed to read file: ${error instanceof Error ? error.message : String(error)}`,
-            filePath,
-            severity: 'error',
-            code: 'read_error',
-          });
-          onProgress?.({ phase: 'parsing', current: processed, total });
-          continue;
-        }
-
-        // Honour MAX_SOURCE_FILE_SIZE_BYTES. Without this check, vendored generated
-        // headers, minified bundles, and other multi-MB files get indexed,
-        // wasting WASM heap and the worker recycle budget on inputs with no
-        // useful symbols. The single-file extractFile path already enforces
-        // this; the bulk path used to silently skip the check.
-        if (stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
-          await storeResult(filePath, content, stats, {
-            nodes: [],
-            edges: [],
-            unresolvedReferences: [],
-            errors: [{
-              message: `File exceeds max size (${stats.size} > ${MAX_SOURCE_FILE_SIZE_BYTES})`,
-              filePath,
-              severity: 'warning',
-              code: 'size_exceeded',
-            }],
-            durationMs: 0,
-          });
-          continue;
-        }
-
-        // Parse on the pool (main thread stays unblocked). Errors/timeouts are
-        // handled inside feed() → recordParseFailure, feeding the retry pass.
-        await feed(filePath, content, stats);
+      if (skipped) {
+        // Not a source file after all — counted as done, stored as nothing.
+        // Counted as skipped too: the scan found it, and a file no tally
+        // holds reads as one the run lost, so the index was called PARTIAL.
+        processed++;
+        filesSkipped++;
+        onProgress?.({ phase: 'parsing', current: processed, total });
+        continue;
       }
 
-      if (aborted) break;
+      if (gone) {
+        // Listed by the scan but not on disk: skipped, stored as nothing. It
+        // still counts toward the tallies, or the run would read as PARTIAL.
+        processed++;
+        filesSkipped++;
+        onProgress?.({ phase: 'parsing', current: processed, total });
+        continue;
+      }
+
+      if (error || content === null || stats === null) {
+        processed++;
+        filesErrored++;
+        errors.push({
+          message: `Failed to read file: ${error instanceof Error ? error.message : String(error)}`,
+          filePath,
+          severity: 'error',
+          code: 'read_error',
+        });
+        onProgress?.({ phase: 'parsing', current: processed, total });
+        continue;
+      }
+
+      // Honour MAX_SOURCE_FILE_SIZE_BYTES. Without this check, vendored generated
+      // headers, minified bundles, and other multi-MB files get indexed,
+      // wasting WASM heap and the worker recycle budget on inputs with no
+      // useful symbols. The single-file extractFile path already enforces
+      // this; the bulk path used to silently skip the check.
+      if (stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
+        await storeResult(filePath, content, stats, {
+          nodes: [],
+          edges: [],
+          unresolvedReferences: [],
+          errors: [{
+            message: `File exceeds max size (${stats.size} > ${MAX_SOURCE_FILE_SIZE_BYTES})`,
+            filePath,
+            severity: 'warning',
+            code: 'size_exceeded',
+          }],
+          durationMs: 0,
+        });
+        continue;
+      }
+
+      const previous = reusableFiles?.get(filePath);
+      const contentHash = previous && hashContent(content);
+      // A later sync or indexFiles can write under different app settings
+      // without advancing the bulk stamp. Only reuse rows older than it.
+      if (previous && previous.indexedAt < cutoff && previous.nodeCount > 0 && !previous.errors?.length &&
+        previous.contentHash === contentHash && previous.language === detectLanguage(filePath, content, overrides, this.rootDir)) {
+        if (nextSeq === nextToStore) {
+          try { reportReused(filePath); }
+          catch (err) { flushError = err; }
+        } else {
+          completed.set(nextSeq++, { ok: 'reused', filePath });
+          await waitForWindow();
+        }
+        continue;
+      }
+
+      // Parse on the pool (main thread stays unblocked). Errors/timeouts
+      // retain their place in the ordered commit and feed the retry pass.
+      if (!parserReady) {
+        pool = await prepareParser();
+        parserReady = true;
+      }
+      feed(filePath, content, stats, contentHash);
+      await waitForWindow();
     }
+    aborted = signal?.aborted === true;
 
     // Drain parses still in flight (skip on abort — we tear down below instead),
     // then commit any results the cursor hasn't reached yet.
@@ -3153,7 +3238,13 @@ export class ExtractionOrchestrator {
         }
       }
     }
-    if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] parse-loop: ${Date.now() - tParseLoop}ms`);
+    if (timing) {
+      console.error(`[phase-timing] parse-loop: ${Date.now() - tParseLoop}ms`);
+      // Read and parse-response times are sums over overlapping jobs, not phases.
+      console.error(`[parse-pipeline-timing] read=${timing.readMs.toFixed(1)}ms (${timing.readBytes} bytes) ` +
+        `parse-response=${timing.parseResponseMs.toFixed(1)}ms window-wait=${timing.windowWaitMs.toFixed(1)}ms ` +
+        `writer-wait=${timing.writerWaitMs.toFixed(1)}ms`);
+    }
 
     if (signal?.aborted || aborted) {
       if (storeWriter) await storeWriter.close();
@@ -3242,7 +3333,7 @@ export class ExtractionOrchestrator {
 
         if (result.nodes.length > 0 || result.errors.length === 0) {
           const stats = await fsp.stat(path.join(this.rootDir, filePath));
-          await this.storeExtractionResult(filePath, content, language, stats, result, commitYield);
+          await this.storeExtractionResult(filePath, content, language, stats, result, commitYield, undefined, forceStore(filePath, language, result));
 
           const idx = errors.indexOf(errEntry);
           if (idx >= 0) errors.splice(idx, 1);
@@ -3297,8 +3388,6 @@ export class ExtractionOrchestrator {
 
           if (result.nodes.length > 0 || result.errors.length === 0) {
             const stats = await fsp.stat(path.join(this.rootDir, filePath));
-            await this.storeExtractionResult(filePath, fullContent, language, stats, result, commitYield);
-
             // Salvaged from comment-stripped source: keep a visible trace in
             // the summary instead of erasing the failure outright — the
             // stored result may be missing whatever the failing parse choked
@@ -3307,6 +3396,9 @@ export class ExtractionOrchestrator {
             errEntry.severity = 'warning';
             errEntry.code = 'salvaged_stripped';
             errEntry.message = `Indexed from comment-stripped source after repeated parse failures (symbols may be incomplete until the file is re-indexed): ${errEntry.message}`;
+            // This record does not certify extraction of the original bytes.
+            result.errors.push(errEntry);
+            await this.storeExtractionResult(filePath, fullContent, language, stats, result, commitYield, undefined, forceStore(filePath, language, result));
             filesErrored--;
             filesIndexed++;
             totalNodes += result.nodes.length;
@@ -3320,10 +3412,15 @@ export class ExtractionOrchestrator {
     // Shut down the parse worker pool.
     if (pool) await pool.destroy();
 
-    if (!signal?.aborted) this.queries.setMetadata('indexed_scope_config', scopeFingerprint);
+    if (!signal?.aborted) {
+      this.queries.setMetadata('indexed_scope_config', scopeFingerprint);
+      if (filesIndexed + filesSkipped >= total && errors.every((e) => e.severity !== 'error')) {
+        load?.onExtractionComplete(extractionStamp);
+      }
+    }
 
     return {
-      success: filesIndexed > 0 || errors.filter((e) => e.severity === 'error').length === 0,
+      success: !signal?.aborted && (filesIndexed > 0 || errors.filter((e) => e.severity === 'error').length === 0),
       filesIndexed,
       filesSkipped,
       filesErrored,
@@ -3331,7 +3428,7 @@ export class ExtractionOrchestrator {
       ...skipSummary(),
       nodesCreated: totalNodes,
       edgesCreated: totalEdges,
-      errors,
+      errors: signal?.aborted ? [{ message: 'Aborted', severity: 'error' }, ...errors] : errors,
       durationMs: Date.now() - startTime,
     };
   }
@@ -3389,6 +3486,13 @@ export class ExtractionOrchestrator {
    * Index a single file
    */
   async indexFile(relativePath: string): Promise<ExtractionResult> {
+    return this.indexSourceFile(relativePath);
+  }
+
+  private async indexSourceFile(
+    relativePath: string,
+    sync?: { readonly snapshot?: SyncSourceSnapshot; readonly parsed?: SyncPreparedParse }
+  ): Promise<ExtractionResult> {
     // Indexing read: follow in-root symlinks (the `../` guard still applies), #935.
     const fullPath = validatePathWithinRoot(this.rootDir, relativePath, { allowSymlinkEscape: true });
 
@@ -3418,7 +3522,16 @@ export class ExtractionOrchestrator {
       };
     }
 
-    // Read file content and stats
+    if (sync?.snapshot) {
+      // Validate the freshly resolved target: a symlink may have been
+      // retargeted since classification or while preloading grammars.
+      const current = observeSyncPath(fullPath);
+      if (current.kind === 'file' && sameSourceStat(sync.snapshot.stats, current.stat)) {
+        return this.indexSourceContent(relativePath, sync.snapshot, sync.parsed);
+      }
+    }
+
+    // Read file content and stats if there is no reusable snapshot.
     let content: string;
     let stats: fs.Stats;
     try {
@@ -3431,8 +3544,10 @@ export class ExtractionOrchestrator {
       }
       content = read.bytes === null ? oversizeStamp(stats.size) : read.bytes.toString('utf8');
     } catch (error) {
-      // Nothing at the path: nothing to index, and not a read failure (#2904).
-      if (isMissingPathError(error)) {
+      // For an explicit file request, nothing at the path is not a failure
+      // (#2904). Sync already classified this path as present; let the next
+      // reconciliation confirm its absence rather than completing a resume.
+      if (!sync && isMissingPathError(error)) {
         return { nodes: [], edges: [], unresolvedReferences: [], errors: [], durationMs: 0 };
       }
       return {
@@ -3462,6 +3577,14 @@ export class ExtractionOrchestrator {
     relativePath: string,
     content: string,
     stats: fs.Stats
+  ): Promise<ExtractionResult> {
+    return this.indexSourceContent(relativePath, { content, stats });
+  }
+
+  private async indexSourceContent(
+    relativePath: string,
+    { content, stats, contentHash }: SourceContent,
+    prepared?: SyncPreparedParse
   ): Promise<ExtractionResult> {
     // Prevent `../` traversal; follow in-root symlinks like the directory walk (#935).
     const fullPath = validatePathWithinRoot(this.rootDir, relativePath, { allowSymlinkEscape: true });
@@ -3494,7 +3617,7 @@ export class ExtractionOrchestrator {
         ],
         durationMs: 0,
       };
-      await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder());
+      await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder(), contentHash);
       return result;
     }
 
@@ -3514,10 +3637,13 @@ export class ExtractionOrchestrator {
     // route nodes / middleware / etc.
     const frameworkNames = this.frameworksForFile(relativePath, this.ensureDetectedFrameworks());
     reportCurrentFile(relativePath);
-    const result = extractFromSource(relativePath, content, language, frameworkNames);
+    const result = prepared?.language === language && prepared.frameworkNames.length === frameworkNames.length &&
+      frameworkNames.every((name, i) => name === prepared.frameworkNames[i])
+      ? prepared.result
+      : extractFromSource(relativePath, content, language, frameworkNames);
 
     // Store in database
-    await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder());
+    await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder(), contentHash);
 
     return result;
   }
@@ -3564,7 +3690,9 @@ export class ExtractionOrchestrator {
     language: Language,
     stats: fs.Stats,
     result: ExtractionResult,
-    onYield?: MaybeYield
+    onYield?: MaybeYield,
+    precomputedHash?: string,
+    forceStore = false
   ): Promise<void> {
     // The file was never parsed: its grammar failed to load (#2335). Storing
     // this would replace the file's symbols with an empty row under the new
@@ -3585,7 +3713,7 @@ export class ExtractionOrchestrator {
     // its own), and the files-table record still lands last, so a
     // partially-stored file has no record and re-indexes.
     const STORE_CHUNK = 2000;
-    const contentHash = hashContent(content);
+    const contentHash = precomputedHash ?? hashContent(content);
 
     // Check if file already exists and hasn't changed. A skip/failure MARKER
     // row (zero nodes + recorded errors, #1557) never blocks a store carrying
@@ -3594,7 +3722,7 @@ export class ExtractionOrchestrator {
     // successful retry's symbols — a permanent empty file presented as
     // recovered (the #1541 wipe, reintroduced through the marker path).
     const existingFile = this.queries.getFileByPath(filePath);
-    if (existingFile && existingFile.contentHash === contentHash) {
+    if (!forceStore && existingFile && existingFile.contentHash === contentHash) {
       const existingIsMarker =
         existingFile.nodeCount === 0 && (existingFile.errors?.length ?? 0) > 0;
       const incomingHasContent = result.nodes.length > 0;
@@ -4090,6 +4218,8 @@ export class ExtractionOrchestrator {
     });
 
     const filesToIndex: string[] = [];
+    const sourceSnapshots = new Map<string, SyncSourceSnapshot>();
+    let retainedSourceBytes = 0;
     const failedFilePaths: string[] = [];
     // === Filesystem reconcile (git-independent) ===
     // The source of truth for "what changed" is the filesystem vs the indexed
@@ -4295,13 +4425,15 @@ export class ExtractionOrchestrator {
       const candidate = trackedNeedingContent.get(filePath);
       const tracked = candidate?.file;
       if (!tracked && !untrackedDiscovered.has(filePath)) continue;
-      if (!tracked && isScoped) {
+      let observedStat = candidate?.stat;
+      if (!tracked && (isScoped || retainedSourceBytes + SYNC_SOURCE_ENTRY_BYTES <= SYNC_SOURCE_CACHE_BYTES)) {
         const observation = observeSyncPath(fullPath);
-        if (observation.kind === 'unknown') {
-          recordUnstattable(filePath, observation.error);
+        if (observation.kind === 'file') {
+          observedStat = observation.stat;
+        } else if (isScoped) {
+          if (observation.kind === 'unknown') recordUnstattable(filePath, observation.error);
           continue;
         }
-        if (observation.kind === 'absent') continue;
       }
 
       // New, or size/mtime changed — read + hash to confirm a real content change.
@@ -4328,18 +4460,26 @@ export class ExtractionOrchestrator {
       }
       const contentHash = hashContent(content);
 
-      if (!tracked) {
+      if (!tracked || tracked.contentHash !== contentHash || hasGrammarLoadFailure(tracked.errors)) {
         onFileChange?.(filePath, content);
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
-        addedFilePaths.push(filePath);
-        filesAdded++;
-      } else if (tracked.contentHash !== contentHash || hasGrammarLoadFailure(tracked.errors)) {
-        onFileChange?.(filePath, content);
-        filesToIndex.push(filePath);
-        changedFilePaths.push(filePath);
-        if (tracked.nodeCount === 0 && (tracked.errors?.length ?? 0) > 0) indexedFromSkip.push(filePath);
-        filesModified++;
+        if (!tracked) {
+          addedFilePaths.push(filePath);
+          filesAdded++;
+        } else {
+          if (tracked.nodeCount === 0 && (tracked.errors?.length ?? 0) > 0) indexedFromSkip.push(filePath);
+          filesModified++;
+        }
+        // Charge two bytes per UTF-16 code unit plus record overhead. Compare
+        // the pre-read path stat with the ending descriptor stat so an edit
+        // during the read cannot qualify a stale or mixed string for reuse.
+        const retainedBytes = content.length * 2 + SYNC_SOURCE_ENTRY_BYTES;
+        if (retainedSourceBytes + retainedBytes <= SYNC_SOURCE_CACHE_BYTES && observedStat &&
+            read.bytes?.length === read.stats.size && sameSourceStat(observedStat, read.stats)) {
+          sourceSnapshots.set(filePath, { content, stats: read.stats, contentHash });
+          retainedSourceBytes += retainedBytes;
+        }
       } else if (candidate && stableTouch(tracked, candidate.stat, read)) {
         this.queries.advanceFileModifiedAt(tracked, read.stats.mtimeMs);
       }
@@ -4365,29 +4505,78 @@ export class ExtractionOrchestrator {
       console.error(`[phase-timing] sync-framework-detect: ${Date.now() - tDetect}ms (${detectedFrameworks ? 'detected again' : 'unchanged'})`);
     }
 
-    // Load only grammars needed for changed files
-    if (filesToIndex.length > 0) {
-      const overrides = loadExtensionOverrides(this.rootDir);
-      await loadGrammarsForLanguages(preloadLanguagesForFiles(filesToIndex, overrides, this.rootDir));
-    }
+    const overrides = filesToIndex.length > 0 ? loadExtensionOverrides(this.rootDir) : {};
+    const languages = preloadLanguagesForFiles(filesToIndex, overrides, this.rootDir);
+    if (languages.length > 0) await loadGrammarsForLanguages(languages);
 
-    // Index changed files
+    // All writes still run in reconcile order. The optional worker path can
+    // only speculate over the already bounded stable snapshots, not read disk.
     const total = filesToIndex.length;
-    for (let i = 0; i < filesToIndex.length; i++) {
-      const filePath = filesToIndex[i]!;
+    let processed = 0;
+    let workerResultsUsed = 0;
+    const storeChanged = async (filePath: string, parsed?: SyncPreparedParse): Promise<void> => {
       onProgress?.({
         phase: 'parsing',
-        current: i + 1,
+        current: ++processed,
         total,
         currentFile: filePath,
       });
 
-      const result = await this.indexFile(filePath);
+      const snapshot = sourceSnapshots.get(filePath);
+      if (snapshot) sourceSnapshots.delete(filePath);
+      const result = await this.indexSourceFile(filePath, { snapshot, parsed });
+      if (parsed?.result === result) workerResultsUsed++;
       if (result.errors.some(e => e.severity === 'error')) failedFilePaths.push(filePath);
       if (!hasGrammarLoadFailure(result.errors)) nodesUpdated += result.nodes.length; // else nothing was stored (#2335)
 
       const pause = backpressure?.();
       if (pause) await pause;
+    };
+    const requestedWorkers = Number(process.env.CODEGRAPH_SYNC_PARSE_WORKERS);
+    const workerCount = Number.isInteger(requestedWorkers) && requestedWorkers >= 2
+      ? Math.min(requestedWorkers, os.availableParallelism(), 4) : 0;
+    const workerScriptPath = path.join(__dirname, 'parse-worker.js');
+    if (workerCount >= 2 && sourceSnapshots.size >= 2 && fs.existsSync(workerScriptPath)) {
+      const started = Date.now();
+      const pool = new ParseWorkerPool({
+        languages,
+        size: workerCount,
+        workerScriptPath,
+        expectedParses: sourceSnapshots.size,
+        grammarBuffers: await readGrammarWasmBytes(languages),
+        recycleInterval: WORKER_RECYCLE_INTERVAL,
+        parseTimeoutMs: PARSE_TIMEOUT_MS,
+      });
+      pool.prewarm();
+      try {
+        const prepare = async (filePath: string) => {
+          const snapshot = sourceSnapshots.get(filePath);
+          if (!snapshot) return { filePath };
+          const { content } = snapshot;
+          const language = detectLanguage(filePath, content, overrides, this.rootDir);
+          if (!isLanguageSupported(language)) return { filePath };
+          const frameworkNames = this.frameworksForFile(filePath, this.ensureDetectedFrameworks());
+          try {
+            const raw = await pool.requestParse({ filePath, content, language, frameworkNames });
+            const result = materializeKernelResult(raw, filePath, language);
+            if (result.errors.some((e) => e.severity === 'error')) return { filePath };
+            return { filePath, parsed: { language, frameworkNames, result } };
+          } catch {
+            // A failed worker must not change the normal sync parser's result.
+            return { filePath };
+          }
+        };
+        for await (const { filePath, parsed } of readAheadInOrder(filesToIndex, prepare, { maxReads: workerCount * 2 })) {
+          await storeChanged(filePath, parsed);
+        }
+      } finally {
+        await pool.destroy();
+      }
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+        console.error(`[phase-timing] sync-parse-workers: ${Date.now() - started}ms (${workerResultsUsed}/${total} reused)`);
+      }
+    } else {
+      for (const filePath of filesToIndex) await storeChanged(filePath);
     }
 
     for (const filePath of indexedFromSkip) {

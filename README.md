@@ -613,6 +613,11 @@ To diagnose the remaining expensive passes on a particular project:
 CODEGRAPH_SYNTH_TIMINGS=1 codegraph index
 ```
 
+For a large change set, try `CODEGRAPH_SYNC_PARSE_WORKERS=4 codegraph sync`.
+Sync parsing is serial by default. The opt-in uses up to four available workers
+for changed files that fit in its source cache. It trades memory for faster
+parsing; graph writes still happen in order.
+
 The local synthetic hotspot benchmark can be run against two built revisions:
 
 ```bash

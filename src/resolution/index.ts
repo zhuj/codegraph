@@ -52,7 +52,7 @@ import { resolveAliasBinding } from './alias-binding';
 import { readCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
 import { detectFrameworks, getAllFrameworkResolvers, getResolvingFrameworks } from './frameworks';
 import { clearDeclaredDependencies } from './frameworks/package-deps';
-import { synthesizeCallbackEdges } from './callback-synthesizer';
+import { RegistryInputCache, synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { FlowChange, planParameterFlows } from './parameter-flow';
 import { MAX_SOURCE_FILE_SIZE_BYTES, readSourceText } from '../file-limits';
@@ -3268,17 +3268,21 @@ export class ReferenceResolver {
     return changed;
   }
 
+  private registryInputs?: RegistryInputCache;
+
   /** Replace synthesis only after every base-resolution pass has finished. */
   async refreshSynthesis(
     dbPath: string,
     onProgress?: (done: number, total: number) => void,
-    backpressure?: () => Promise<void> | null
+    backpressure?: () => Promise<void> | null,
+    options?: { reuseRegistryInputs: boolean }
   ): Promise<number> {
     this.clearCaches();
     const stage = new SynthesisStage(dbPath);
     try {
       const fresh = new ReferenceResolver(this.projectRoot, stage.queries);
-      const count = await synthesizeCallbackEdges(stage.queries, fresh.context, onProgress, null, backpressure);
+      const inputs = options?.reuseRegistryInputs ? (this.registryInputs ??= new RegistryInputCache()) : undefined;
+      const count = await synthesizeCallbackEdges(stage.queries, fresh.context, onProgress, null, backpressure, undefined, inputs);
       await stage.publish(backpressure);
       return count;
     } finally {

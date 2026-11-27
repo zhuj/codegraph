@@ -193,6 +193,41 @@ interface UnresolvedRefRow {
   name_tail: string;
 }
 
+type UnresolvedBatchReader = (afterRowId: number, limit: number) => UnresolvedReference[];
+
+function prepareUnresolvedBatchReader(db: SqliteDatabase, prerequisites: boolean | undefined): UnresolvedBatchReader {
+  // Keep status/name_tail inside SQLite. Array rows also avoid allocating a
+  // named property per column for every ref that crosses the JS boundary.
+  const filter = prerequisites === undefined ? ''
+    : ` AND reference_kind ${prerequisites ? 'IN' : 'NOT IN'} ('imports', 'extends', 'implements')`;
+  const stmt = db.prepare(
+    `SELECT id, from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language
+     FROM unresolved_refs WHERE status = 'pending' AND id > ?${filter} ORDER BY id LIMIT ?`
+  );
+  if (stmt.rowsAsArrays()) {
+    type Row = [number, string, string, EdgeKind, number, number, string | null, string, Language];
+    return (after, limit) => (stmt.all(after, limit) as Row[]).map(
+      ([rowId, fromNodeId, referenceName, referenceKind, line, column, candidates, filePath, language]) => ({
+        rowId, fromNodeId, referenceName, referenceKind, line, column,
+        candidates: candidates ? safeJsonParse(candidates, undefined) : undefined,
+        filePath, language,
+      })
+    );
+  }
+  // Older Node runtimes expose only object rows.
+  return (after, limit) => (stmt.all(after, limit) as Omit<UnresolvedRefRow, 'status' | 'name_tail'>[]).map((row) => ({
+    rowId: row.id,
+    fromNodeId: row.from_node_id,
+    referenceName: row.reference_name,
+    referenceKind: row.reference_kind as EdgeKind,
+    line: row.line,
+    column: row.col,
+    candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+    filePath: row.file_path,
+    language: row.language as Language,
+  }));
+}
+
 /**
  * Convert database row to Node object
  */
@@ -514,9 +549,9 @@ export class QueryBuilder {
     getCobolFilesByStem?: SqliteStatement;
     getUnresolvedCount?: SqliteStatement;
     getUnresolvedBatch?: SqliteStatement;
-    getUnresolvedBatchAfter?: SqliteStatement;
-    getUnresolvedPrerequisitesAfter?: SqliteStatement;
-    getUnresolvedDependentsAfter?: SqliteStatement;
+    getUnresolvedBatchAfter?: UnresolvedBatchReader;
+    getUnresolvedPrerequisitesAfter?: UnresolvedBatchReader;
+    getUnresolvedDependentsAfter?: UnresolvedBatchReader;
     deleteRefsByRowIdsFull?: SqliteStatement;
     getAllFilePaths?: SqliteStatement;
     getAllNodeNames?: SqliteStatement;
@@ -4596,25 +4631,8 @@ export class QueryBuilder {
     // memory; the default preserves the public reader's original enumeration.
     const key = prerequisites === undefined ? 'getUnresolvedBatchAfter'
       : prerequisites ? 'getUnresolvedPrerequisitesAfter' : 'getUnresolvedDependentsAfter';
-    if (!this.stmts[key]) {
-      const filter = prerequisites === undefined ? ''
-        : ` AND reference_kind ${prerequisites ? 'IN' : 'NOT IN'} ('imports', 'extends', 'implements')`;
-      this.stmts[key] = this.db.prepare(
-        `SELECT * FROM unresolved_refs WHERE status = 'pending' AND id > ?${filter} ORDER BY id LIMIT ?`
-      );
-    }
-    const rows = this.stmts[key]!.all(afterRowId, limit) as UnresolvedRefRow[];
-    return rows.map((row) => ({
-      fromNodeId: row.from_node_id,
-      referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
-      line: row.line,
-      column: row.col,
-      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
-      filePath: row.file_path,
-      language: row.language as Language,
-      rowId: row.id,
-    }));
+    this.stmts[key] ??= prepareUnresolvedBatchReader(this.db, prerequisites);
+    return this.stmts[key](afterRowId, limit);
   }
 
   /**

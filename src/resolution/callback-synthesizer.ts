@@ -3979,7 +3979,87 @@ function resolveRegistryHandler(ctx: ResolutionContext, name: string, chained: s
   return cands.find((n) => n.kind === 'method') ?? null;
 }
 
-async function objectRegistryEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+interface RegistrySite {
+  readonly line: number;
+  readonly chained: string | null;
+  readonly registry: { readonly names: readonly string[]; readonly line: number };
+}
+
+/** Only source syntax; no node IDs, name resolution, fan-out or deduplication. */
+function scanRegistrySites(file: string, content: string): readonly RegistrySite[] {
+  // Skip minified/generated bundles (draco, three.min, base64…): their pervasive `h[x](...)`
+  // calls + single-letter `{a:b}` literals are a false-positive minefield. Average line
+  // length is the reliable tell — real source ~30–80, minified in the hundreds/thousands.
+  const newlines = (content.match(/\n/g)?.length ?? 0) + 1;
+  if (content.length / newlines > 200) return [];
+  const safe = stripCommentsForRegex(content, /\.(?:jsx?|mjs|cjs)$/.test(file) ? 'javascript' : 'typescript');
+
+  // Dispatch sites: `(new )?<ref>[<ident-key>]` followed by a call or a chained method.
+  // A quoted-string key (`['save']`) does NOT match — that's a static access, not dispatch.
+  const lineOf = makeLineAt(safe, 1);
+  const dispatches: Array<{ ref: string; line: number; chained: string | null }> = [];
+  for (let dm = nextRegistryDispatch(safe, 0); dm; dm = nextRegistryDispatch(safe, dm.index + dm[0].length)) {
+    const win = safe.slice(dm.index, dm.index + 160);
+    const cm = /\]\s*\([^)]*\)\s*\.\s*([A-Za-z_$][\w$]*)/.exec(win) || /\]\s*\.\s*([A-Za-z_$][\w$]*)/.exec(win);
+    dispatches.push({ ref: dm[1]!, line: lineOf(dm.index), chained: cm ? cm[1]! : null });
+  }
+  if (!dispatches.length) return [];
+  // Normalize a leading `this.` so a class FIELD-INITIALIZER registry (`commands = {…}`)
+  // matches a `this.commands[k]` dispatch, not just the constructor form `this.commands = {…}`.
+  const norm = (r: string) => r.replace(/^this\./, '');
+  const refs = new Set(dispatches.map((d) => norm(d.ref)));
+
+  // Registries: an object literal assigned to a dispatched ref, ≥2 candidate entry names.
+  REGISTRY_ASSIGN_RE.lastIndex = 0;
+  const registries = new Map<string, { names: string[]; line: number }>();
+  let am: RegExpExecArray | null;
+  while ((am = REGISTRY_ASSIGN_RE.exec(safe))) {
+    const lhs = norm(am[1] ?? am[2]!);
+    if (!refs.has(lhs) || registries.has(lhs)) continue;
+    const body = braceBody(safe, am.index + am[0].length - 1);
+    if (!body) continue;
+    const names = registryEntryNames(body); // depth-0 `key: Identifier` entries only
+    if (names.length >= REGISTRY_MIN_ENTRIES) {
+      registries.set(lhs, { names, line: lineOf(am.index) });
+    }
+  }
+  const sites: RegistrySite[] = [];
+  for (const { ref, line, chained } of dispatches) {
+    const registry = registries.get(norm(ref));
+    if (registry) sites.push({ line, chained, registry });
+  }
+  return sites;
+}
+
+/**
+ * Optional, process-local memo for the registry's text scan, including misses.
+ * Path selects the masking dialect, and exact source equality proves reuse:
+ * even a same-size edit is a miss, with no dependence on a stat or DB hash.
+ * Only retain results proportional to bounded admitted text. Once full, leave
+ * the existing entries in place; evicting on every miss thrashes a full scan.
+ */
+export class RegistryInputCache {
+  private readonly entries = new Map<string, { content: string; sites: readonly RegistrySite[] }>();
+  private retainedChars = 0;
+
+  scan(file: string, content: string): readonly RegistrySite[] {
+    const previous = this.entries.get(file);
+    if (previous?.content === content) return previous.sites;
+    if (previous) {
+      this.entries.delete(file);
+      this.retainedChars -= previous.content.length;
+    }
+    const sites = scanRegistrySites(file, content);
+    if (content.length <= 128 * 1024 && this.entries.size < 1024 &&
+        this.retainedChars + content.length <= 4 * 1024 * 1024) {
+      this.entries.set(file, { content, sites });
+      this.retainedChars += content.length;
+    }
+    return sites;
+  }
+}
+
+async function objectRegistryEdges(ctx: ResolutionContext, onYield: MaybeYield, inputs?: RegistryInputCache): Promise<Edge[]> {
   let scannedFiles = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
@@ -3991,55 +4071,20 @@ async function objectRegistryEdges(ctx: ResolutionContext, onYield: MaybeYield):
     const content = ctx.readFile(file);
     // Cheap pre-filter: a computed member access BY NAME (`ident[ident`) — the dispatch shape.
     if (!content || !/[\w$]\s*\[\s*[A-Za-z_$]/.test(content)) continue;
-    // Skip minified/generated bundles (draco, three.min, base64…): their pervasive `h[x](...)`
-    // calls + single-letter `{a:b}` literals are a false-positive minefield. Average line
-    // length is the reliable tell — real source ~30–80, minified in the hundreds/thousands.
-    const newlines = (content.match(/\n/g)?.length ?? 0) + 1;
-    if (content.length / newlines > 200) continue;
-    const safe = stripCommentsForRegex(content, /\.(?:jsx?|mjs|cjs)$/.test(file) ? 'javascript' : 'typescript');
+    const sites = inputs?.scan(file, content) ?? scanRegistrySites(file, content);
+    if (!sites.length) continue;
 
-    // 1. Dispatch sites: `(new )?<ref>[<ident-key>]` followed by a call or a chained method.
-    //    A quoted-string key (`['save']`) does NOT match — that's a static access, not dispatch.
-    const lineOf = makeLineAt(safe, 1);
-    const dispatches: Array<{ ref: string; line: number; chained: string | null }> = [];
-    for (let dm = nextRegistryDispatch(safe, 0); dm; dm = nextRegistryDispatch(safe, dm.index + dm[0].length)) {
-      const win = safe.slice(dm.index, dm.index + 160);
-      const cm = /\]\s*\([^)]*\)\s*\.\s*([A-Za-z_$][\w$]*)/.exec(win) || /\]\s*\.\s*([A-Za-z_$][\w$]*)/.exec(win);
-      dispatches.push({ ref: dm[1]!, line: lineOf(dm.index), chained: cm ? cm[1]! : null });
-    }
-    if (!dispatches.length) continue;
-    // Normalize a leading `this.` so a class FIELD-INITIALIZER registry (`commands = {…}`)
-    // matches a `this.commands[k]` dispatch, not just the constructor form `this.commands = {…}`.
-    const norm = (r: string) => r.replace(/^this\./, '');
-    const refs = new Set(dispatches.map((d) => norm(d.ref)));
-
-    // 2. Registries: an object literal assigned to a dispatched ref, ≥2 entries resolving to callables.
-    REGISTRY_ASSIGN_RE.lastIndex = 0;
-    const registries = new Map<string, { names: string[]; line: number }>();
-    let am: RegExpExecArray | null;
-    while ((am = REGISTRY_ASSIGN_RE.exec(safe))) {
-      const lhs = norm(am[1] ?? am[2]!);
-      if (!refs.has(lhs) || registries.has(lhs)) continue;
-      const body = braceBody(safe, am.index + am[0].length - 1);
-      if (!body) continue;
-      const names = registryEntryNames(body); // depth-0 `key: Identifier` entries only
-      if (names.length >= REGISTRY_MIN_ENTRIES) {
-        registries.set(lhs, { names, line: lineOf(am.index) });
-      }
-    }
-    if (!registries.size) continue;
-
-    // 3. Link each dispatcher → each registered handler's callable entry.
+    // Resolve the current graph on every run, even for a cached parse. A
+    // change outside this file can replace a target or open a slot under the
+    // cap; the unchanged registry-order merge still arbitrates duplicate pairs.
     const nodesInFile = ctx.getNodesInFile(file);
-    for (const d of dispatches) {
-      const reg = registries.get(norm(d.ref));
-      if (!reg) continue;
-      const disp = enclosingFn(nodesInFile, d.line);
+    for (const { line, chained, registry } of sites) {
+      const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue;
       let added = 0;
-      for (const name of reg.names) {
+      for (const name of registry.names) {
         if (added >= REGISTRY_FANOUT_CAP) break;
-        const target = resolveRegistryHandler(ctx, name, d.chained);
+        const target = resolveRegistryHandler(ctx, name, chained);
         if (!target || target.id === disp.id) continue;
         const key = `${disp.id}>${target.id}`;
         if (seen.has(key)) continue;
@@ -4048,9 +4093,9 @@ async function objectRegistryEdges(ctx: ResolutionContext, onYield: MaybeYield):
           source: disp.id,
           target: target.id,
           kind: 'calls',
-          line: d.line,
+          line,
           provenance: 'heuristic',
-          metadata: { synthesizedBy: 'object-registry', via: name, registeredAt: `${file}:${reg.line}` },
+          metadata: { synthesizedBy: 'object-registry', via: name, registeredAt: `${file}:${registry.line}` },
         });
         added++;
       }
@@ -4536,6 +4581,22 @@ async function springEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
 // gates above still decide whether anything links to it.
 const MEDIATR_HANDLER_BASE_RE = /(?:IRequestHandler|INotificationHandler)\s*<\s*([A-Za-z_]\w*)/;
 const MEDIATR_DISPATCH_RE = /([A-Za-z_][\w.]*)\s*\.\s*(Send|Publish)\s*\(\s*(new\s+[A-Z]\w*|[A-Za-z_]\w*)/g;
+
+/** The dispatch regex's existence test, without retrying every start in a long receiver token. */
+function hasMediatRDispatchPattern(content: string): boolean {
+  // Both argument alternatives start with [A-Za-z_], and the identifier
+  // alternative needs nothing after that first character for a match.
+  const suffix = /\.\s*(?:Send|Publish)\s*\(\s*[A-Za-z_]/g;
+  for (let m = suffix.exec(content); m; m = suffix.exec(content)) {
+    let i = m.index - 1;
+    while (i >= 0 && /\s/.test(content.charAt(i))) i--;
+    // Reading back through [\w.]*, the first ASCII letter or underscore can
+    // start the receiver. Each matched suffix's `(` bounds the next lookback.
+    while (i >= 0 && /[\d.]/.test(content.charAt(i))) i--;
+    if (/[A-Za-z_]/.test(content.charAt(i))) return true;
+  }
+  return false;
+}
 const MEDIATR_RECEIVER_RE = /(?:mediator|sender|publisher)/i;
 const MEDIATR_CS_EXT = /\.cs$/;
 const MEDIATR_FANOUT_CAP = 80;
@@ -5359,7 +5420,8 @@ export interface SynthPassDef {
     queries: QueryBuilder,
     ctx: ResolutionContext,
     yieldToLoop: MaybeYield,
-    subProgress?: (fraction: number) => void
+    subProgress?: (fraction: number) => void,
+    registryInputs?: RegistryInputCache
   ) => Promise<Edge[]>;
 }
 
@@ -5387,7 +5449,7 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
   if (/[\w$]\s*\[\s*[A-Za-z_$]/.test(content) || /\b(?:dispatch|commit)\s*\(/.test(content)) return true;
   const patterns = [THUNK_DECL_RE, CELERY_TASK_DECORATOR_RE, CELERY_DISPATCH_RE,
     SPRING_LISTENER_ANNO_RE, SPRING_APP_LISTENER_RE, SPRING_PUBLISH_RE,
-    MEDIATR_HANDLER_BASE_RE, MEDIATR_DISPATCH_RE, SIDEKIQ_WORKER_RE, SIDEKIQ_DISPATCH_RE,
+    MEDIATR_HANDLER_BASE_RE, SIDEKIQ_WORKER_RE, SIDEKIQ_DISPATCH_RE,
     ERLANG_CALLBACK_DECL_RE, ERLANG_DISPATCH_RE, LARAVEL_DISPATCH_RE, ARKUI_EMITTER_CALL_RE,
     ARKUI_ROUTER_RE];
   for (const re of patterns) {
@@ -5396,6 +5458,7 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
     re.lastIndex = 0;
     if (matches) return true;
   }
+  if (hasMediatRDispatchPattern(content)) return true;
   // Field-backed observers use method-name gates rather than fixed call names.
   const words = /[A-Za-z_$][\w$]*/g;
   for (let word = words.exec(content); word; word = words.exec(content)) {
@@ -5463,7 +5526,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'thunkEdges', gate: (has) => has(...JS_FAMILY), run: (q, c, y) => reduxThunkEdges(q, c, y) },
   // `export const extname = isWin ? win32.extname : posix.extname` onto each function it can hold.
   { name: 'constAliasEdges', gate: (has) => has(...JS_FAMILY), run: (q, c, y) => constAliasEdges(q, c, y) },
-  { name: 'registryEdges', gate: ALWAYS, run: (_q, c, y) => objectRegistryEdges(c, y) },
+  { name: 'registryEdges', gate: ALWAYS, run: (_q, c, y, _sub, inputs) => objectRegistryEdges(c, y, inputs) },
   { name: 'rtkEdges', gate: (has) => has(...JS_FAMILY), run: (q, c, y) => rtkQueryEdges(q, c, y) },
   { name: 'piniaEdges', gate: (has) => has('vue', ...JS_FAMILY), run: (_q, c, y) => piniaStoreEdges(c, y) },
   { name: 'vuexEdges', gate: (has) => has('vue', ...JS_FAMILY), run: (_q, c, y) => vuexDispatchEdges(c, y) },
@@ -5547,7 +5610,9 @@ export async function synthesizeCallbackEdges(
   backpressure?: () => Promise<void> | null,
   // Main-thread work to run while the pool computes the passes (the main
   // thread otherwise only waits there) — e.g. building a deferred index.
-  whilePoolBusy?: () => void
+  whilePoolBusy?: () => void,
+  // Optional memo owned by a project instance; only the sequential path uses it.
+  registryInputs?: RegistryInputCache
 ): Promise<number> {
   // Each sub-pass below is a whole-graph scan, and there are ~30 of them, all
   // running synchronously on the indexer's main thread. Their AGGREGATE can run
@@ -5659,7 +5724,7 @@ export async function synthesizeCallbackEdges(
     const pass = SYNTH_PASSES[i]!;
     const t0 = Date.now();
     reportCurrentDirectory('.');
-    passEdges[i] = await pass.run(queries, ctx, yieldToLoop, subProgress);
+    passEdges[i] = await pass.run(queries, ctx, yieldToLoop, subProgress, pool ? undefined : registryInputs);
     await yieldToLoop();
     markPass(pass.name, Date.now() - t0);
   };

@@ -735,12 +735,16 @@ export class CodeGraph {
       try {
         const gitState = this.orchestrator.beginGitIndexState(true);
         const before = this.queries.getNodeAndEdgeCount();
+        const extractionInputsKey = 'bulk_extraction_inputs';
+        let reusableInputs: string | null = null;
+        let extractedInputs: string | null = null;
         // Mark the index as in-flight BEFORE any writes: a run killed
         // mid-index (OOM, SIGKILL, the #850 liveness watchdog) leaves this
         // marker behind, so `codegraph status` can tell a truncated index
         // from a completed one instead of silently serving partial results.
         try {
-          const priorVersion = this.getIndexState() === 'indexing'
+          const priorState = this.getIndexState();
+          const priorVersion = priorState === 'indexing'
             ? this.queries.getMetadata(INDEXING_EXTRACTION_VERSION_KEY)
             : this.queries.getMetadata('indexed_with_extraction_version');
           const version = String(EXTRACTION_VERSION);
@@ -749,6 +753,9 @@ export class CodeGraph {
             this.queries.setMetadata(INDEXING_EXTRACTION_VERSION_KEY, compatible ? version : '');
             this.queries.setMetadata('index_state', 'indexing');
           })();
+          if (!freshDb && priorState === 'complete' && priorVersion === version) {
+            reusableInputs = this.queries.getMetadata(extractionInputsKey);
+          }
         } catch { /* metadata is advisory */ }
         // Segment vocabulary. On a fresh database it starts empty, and the node
         // write path fills it as every file indexes below. Over an existing
@@ -759,15 +766,11 @@ export class CodeGraph {
         if (freshDb) {
           try { this.queries.clearNameSegmentVocab(); } catch { /* vocab is advisory — never fail an index over it */ }
         }
-        // Bulk FTS mode for the mass-insert phase: drop the per-row FTS sync
-        // triggers, rebuild nodes_fts once from the nodes table afterwards.
-        // Crash inside the window is healed on the next DatabaseConnection.open.
-        this.db.beginBulkNodeLoad();
-        // Fresh-init only: also drop the parse-lane secondary indexes for the
-        // mass insert (the store-writer's B-tree-maintenance floor, plan §4d)
-        // and rebuild each in one scan afterwards. Incremental runs keep them
-        // — they delete per-file rows mid-phase through the file_path indexes.
-        if (freshDb) this.db.beginBulkParseLoad();
+        // Full rewrites rebuild FTS once after loading the nodes. Compatible
+        // in-place updates keep the triggers live so a few changed/deleted
+        // files don't require retokenizing the whole graph. A crash inside the
+        // bulk window is healed on the next DatabaseConnection.open.
+        let bulkFts = false;
         let result: IndexResult;
         try {
           result = await this.orchestrator.indexAll(
@@ -775,20 +778,40 @@ export class CodeGraph {
             options.signal,
             options.verbose,
             walValve ? () => walValve!.backpressure() : undefined,
-            // Store-writer offload is fresh-DB-only: with any pre-existing
-            // data the store path must read (existing-file checks, cross-file
-            // edge snapshots) and delete, which belongs on one thread.
-            freshDb ? { dbPath: this.db.getPath(), fastInit } : null
+            {
+              reusableInputs,
+              // With any pre-existing data, the store path must read and
+              // delete to preserve incoming cross-file edges.
+              storeWriter: freshDb ? { dbPath: this.db.getPath(), fastInit } : undefined,
+              beginBulkRewrite: () => {
+                // A cancelled/incomplete rewrite must not leave its old
+                // compatibility proof behind.
+                this.queries.setMetadata(extractionInputsKey, '');
+                // Hash-based resume can finish a fresh build, but cannot
+                // replay unchanged bytes from before an incompatible rewrite.
+                if (!freshDb) this.queries.setMetadata(INDEXING_EXTRACTION_VERSION_KEY, '');
+                bulkFts = true;
+                this.db.beginBulkNodeLoad();
+                // In-place writes need the file_path indexes for deletions.
+                if (freshDb) this.db.beginBulkParseLoad();
+              },
+              onExtractionComplete: (stamp) => { extractedInputs = stamp; },
+            }
           );
         } finally {
-          if (freshDb) {
-            const tIdx = Date.now();
-            await this.db.endBulkParseLoad();
-            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] parse-index-rebuild: ${Date.now() - tIdx}ms`);
+          try {
+            if (freshDb && bulkFts) {
+              const tIdx = Date.now();
+              await this.db.endBulkParseLoad();
+              if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] parse-index-rebuild: ${Date.now() - tIdx}ms`);
+            }
+          } finally {
+            if (bulkFts) {
+              const tFts = Date.now();
+              this.db.endBulkNodeLoad();
+              if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] fts-rebuild: ${Date.now() - tFts}ms`);
+            }
           }
-          const tFts = Date.now();
-          this.db.endBulkNodeLoad();
-          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] fts-rebuild: ${Date.now() - tFts}ms`);
         }
 
         // Fold the parse phase's WAL BEFORE the first post-parse reads
@@ -974,6 +997,12 @@ export class CodeGraph {
                 code: 'index_partial',
               });
             } else {
+              if (extractedInputs !== null && !options.signal?.aborted) {
+                // A later sync does not publish this bulk-only stamp. Only
+                // files whose write can be ordered strictly before it are
+                // safe to reuse under these extraction inputs.
+                this.queries.setMetadata(extractionInputsKey, `${extractedInputs}:${Date.now()}`);
+              }
               this.queries.setMetadata('index_state', 'complete');
               if (discovered !== undefined) {
                 this.queries.setMetadata('index_files_discovered', String(discovered));
@@ -1321,7 +1350,8 @@ export class CodeGraph {
         const pythonFilesBefore = this.pythonFilePaths();
         // An interrupted index may have absorbed its changed files before
         // resolution/synthesis. Detect those orphans BEFORE this sync adds refs.
-        let refreshSynthesis = recoveringIndex || this.queries.getMetadata('synthesis_pending') === '1' ||
+        const pendingSynthesis = this.queries.getMetadata('synthesis_pending') === '1';
+        let refreshSynthesis = recoveringIndex || pendingSynthesis ||
           this.queries.getUnresolvedReferencesCount() > 0;
         if (refreshSynthesis) this.queries.setMetadata('synthesis_pending', '1');
         // The route nodes as they were before this sync replaced or removed a
@@ -1940,7 +1970,7 @@ export class CodeGraph {
           } else {
             await this.resolver.refreshSynthesis(this.db.getPath(), (done, total) => {
               options.onProgress?.({ phase: 'linking', current: done, total });
-            }, backpressure);
+            }, backpressure, { reuseRegistryInputs: !recoveringIndex && !pendingSynthesis });
             this.queries.setMetadata('synthesis_pending', '0');
             this.lastSynthesisAt = Date.now();
             synthesized = true;
