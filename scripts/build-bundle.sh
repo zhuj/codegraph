@@ -12,7 +12,7 @@
 #   scripts/build-bundle.sh <target> [bun-version]
 #     target:        darwin-arm64 | darwin-x64 | linux-x64 | linux-arm64
 #                  | win32-x64 | win32-arm64
-#     bun-version:   e.g. 1.4.4 (default below; pin for reproducible builds)
+#     bun-version:   e.g. 1.4.5 (default below; pin for reproducible builds)
 #
 # Output:
 #   unix:    release/codegraph-<target>.tar.gz   (launcher: bin/codegraph)
@@ -21,10 +21,10 @@ set -euo pipefail
 
 TARGET="${1:?usage: build-bundle.sh <target> [bun-version]}"
 # Keep the workflow's host Bun pin in sync with this bundled runtime default.
-BUN_VERSION="${2:-1.4.4}"
+BUN_VERSION="${2:-1.4.5}"
 BUN_VERSION="${BUN_VERSION#v}"
 if ! [[ "$BUN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "[bundle] error: expected a Bun release version (e.g. 1.4.4), got ${BUN_VERSION}" >&2
+  echo "[bundle] error: expected a Bun release version (e.g. 1.4.5), got ${BUN_VERSION}" >&2
   exit 1
 fi
 

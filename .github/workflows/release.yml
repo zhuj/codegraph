@@ -99,7 +99,7 @@ jobs:
       # Host build runtime; keep the pin in sync with scripts/build-bundle.sh.
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.4
+          bun-version: 1.4.5
 
       - name: Upgrade npm for OIDC trusted publishing
         # Trusted publishing needs npm >= 11.5; Node 22 bundles npm 10.

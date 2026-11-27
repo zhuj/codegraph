@@ -1,6 +1,8 @@
 /.cache/
 /.materialized/
 /.config.yaml
-/.object-mcp-lock.sqlite*
-/.object-mcp-recovery/
-/.object-mcp-operations/
+/.slim/
+# Generated tool state can also live in the structured source directory.
+.object-mcp-lock.sqlite*
+.object-mcp-recovery/
+.object-mcp-operations/
